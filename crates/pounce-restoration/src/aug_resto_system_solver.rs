@@ -632,7 +632,7 @@ fn low_rank_orig_block(w: &dyn Matrix, n_orig: Index) -> Option<LowRankUpdateSym
     // flat dense space: the resto `W` stores them as 5-block resto
     // `CompoundVector`s, which the inner solver's SMW path cannot
     // multiply against an orig-sized iterate.
-    let mut pack = |cols: Vec<Vec<Number>>| -> Option<Rc<MultiVectorMatrix>> {
+    let pack = |cols: Vec<Vec<Number>>| -> Option<Rc<MultiVectorMatrix>> {
         if cols.is_empty() {
             return None;
         }

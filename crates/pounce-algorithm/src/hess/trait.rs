@@ -68,6 +68,9 @@ pub trait HessianUpdater {
         None
     }
 
+    /// Actual partitioned element census, including diagonal degradation.
+    fn partitioned_stats(&self) -> Option<crate::hess::partitioned_quasi_newton::PartitionStats> { None }
+
     /// Discard the accumulated quasi-Newton curvature and re-anchor the
     /// approximation at the current iterate, returning `true` if there
     /// was anything to discard (gh#818).

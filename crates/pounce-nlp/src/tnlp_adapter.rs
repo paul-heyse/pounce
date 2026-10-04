@@ -127,6 +127,7 @@ pub struct TNLPAdapter {
     tnlp: Rc<RefCell<dyn TNLP>>,
     info: NlpInfo,
     classification: BoundClassification,
+    effective_fixed_treatment: FixedVarTreatment,
     nlp_lower_bound_inf: Number,
     nlp_upper_bound_inf: Number,
 }
@@ -290,6 +291,7 @@ impl TNLPAdapter {
             tnlp,
             info,
             classification,
+            effective_fixed_treatment: treatment,
             nlp_lower_bound_inf,
             nlp_upper_bound_inf,
         })
@@ -299,6 +301,8 @@ impl TNLPAdapter {
         &self.info
     }
 
+    /// Treatment actually selected, including the degrees-of-freedom fallback.
+    pub fn effective_fixed_treatment(&self) -> FixedVarTreatment { self.effective_fixed_treatment }
     pub fn classification(&self) -> &BoundClassification {
         &self.classification
     }

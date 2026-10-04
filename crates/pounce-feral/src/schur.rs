@@ -146,6 +146,9 @@ impl FeralSchurSolver {
         ja: &[Index],
         schur_indices: &[usize],
     ) -> ESymSolverStatus {
+        let n_s = schur_indices.len();
+        let extent = (dim.max(0) as usize).saturating_add(ia.len()).saturating_add((dim.max(0) as usize).saturating_mul(n_s)).saturating_add(n_s.saturating_mul(n_s)).saturating_mul(128);
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage { owner: "schur-factors-coupling-separator-refinement", known_bytes: extent, opaque: true }).is_err() { return self.fail(); }
         let dim = dim as usize;
         if ia.len() != ja.len() {
             return self.fail();
@@ -273,7 +276,13 @@ impl FeralSchurSolver {
                 Ok(m) => m,
                 Err(_) => return self.set_status(ESymSolverStatus::FatalError),
             };
-        let (neg_ff, singular_ff) = match self.ff_solver.factor(&ff_mat, None) {
+        let (neg_ff, singular_ff) = match {
+            use pounce_common::observed::{Operation, Path, Primitive};
+            let Ok(operation) = Operation::begin(Path::SchurF, Primitive::Factor, 0, 0) else { return self.set_status(ESymSolverStatus::FatalError); };
+            let status = self.ff_solver.factor(&ff_mat, None);
+            if !operation.finish(matches!(&status, FactorStatus::Success)) { return self.set_status(ESymSolverStatus::FatalError); }
+            status
+        } {
             FactorStatus::Success => match self.ff_solver.inertia() {
                 Some(i) => (i.negative, i.zero > 0),
                 None => (self.ff_solver.num_negative_eigenvalues(), false),
@@ -299,10 +308,13 @@ impl FeralSchurSolver {
         // Refine against the original A_FF when `cfg.refine`, matching the
         // monolithic backend — S's accuracy hinges on W's.
         let w = {
+            use pounce_common::observed::{Operation, Path, Primitive};
+            let Ok(operation) = Operation::begin(Path::SchurF, Primitive::Backsolve, self.n_s, if self.cfg.refine { self.cfg.refine_max_steps } else { 0 }) else { return self.set_status(ESymSolverStatus::FatalError); };
             let r = match (self.cfg.refine, self.ff_matrix.as_ref()) {
-                (true, Some(m)) => self.ff_solver.solve_many_refined(m, &self.afs, self.n_s),
+                (true, Some(m)) => self.ff_solver.solve_many_refined_opts(m, &self.afs, self.n_s, feral::RefineOptions::with_max_steps(self.cfg.refine_max_steps)),
                 _ => self.ff_solver.solve_many(&self.afs, self.n_s),
             };
+            if !operation.finish(r.is_ok()) { return self.set_status(ESymSolverStatus::FatalError); }
             match r {
                 Ok(w) => w,
                 Err(_) => return self.set_status(ESymSolverStatus::FatalError),
@@ -342,7 +354,13 @@ impl FeralSchurSolver {
             Ok(m) => m,
             Err(_) => return self.set_status(ESymSolverStatus::FatalError),
         };
-        let (neg_s, singular_s) = match self.s_solver.factor(&s_mat, None) {
+        let (neg_s, singular_s) = match {
+            use pounce_common::observed::{Operation, Path, Primitive};
+            let Ok(operation) = Operation::begin(Path::SchurS, Primitive::Factor, 0, 0) else { return self.set_status(ESymSolverStatus::FatalError); };
+            let status = self.s_solver.factor(&s_mat, None);
+            if !operation.finish(matches!(&status, FactorStatus::Success)) { return self.set_status(ESymSolverStatus::FatalError); }
+            status
+        } {
             FactorStatus::Success => match self.s_solver.inertia() {
                 Some(i) => (i.negative, i.zero > 0),
                 None => (self.s_solver.num_negative_eigenvalues(), false),
@@ -443,28 +461,41 @@ impl FeralSchurSolver {
     pub fn last_solve_status(&self) -> ESymSolverStatus {
         self.last_status
     }
-    /// Feral delegates all recovery to the IPM's δ-perturbation loop (there is
-    /// no higher pivot-quality mode), matching [`crate::FeralSolverInterface`].
+    /// Apply the same typed quality policy to both actual FERAL factors.
+    /// Numerical escalation is still owned by FERAL and its caller's IPM.
     pub fn increase_quality(&mut self) -> bool {
-        false
+        if !self.cfg.increase_quality { return false; }
+        let ff = self.ff_solver.increase_quality();
+        let ss = self.s_solver.increase_quality();
+        let changed = ff || ss;
+        if changed { self.have_factor = false; }
+        changed
     }
 
     /// Single-RHS `A_FF⁻¹` solve, iteratively refined against the original
     /// `A_FF` when `cfg.refine` (matching the monolithic backend's default).
     fn ff_solve(&self, rhs: &[Number]) -> Option<Vec<Number>> {
+        use pounce_common::observed::{Operation, Path, Primitive};
+        let operation = Operation::begin(Path::SchurF, Primitive::Backsolve, 1, if self.cfg.refine { self.cfg.refine_max_steps } else { 0 }).ok()?;
+        let result = 
         match (self.cfg.refine, self.ff_matrix.as_ref()) {
-            (true, Some(m)) => self.ff_solver.solve_refined(m, rhs),
+            (true, Some(m)) => self.ff_solver.solve_refined_opts(m, rhs, feral::RefineOptions::with_max_steps(self.cfg.refine_max_steps)),
             _ => self.ff_solver.solve(rhs),
         }
-        .ok()
+        .ok();
+        if operation.finish(result.is_some()) { result } else { None }
     }
     /// Single-RHS `S⁻¹` solve, refined against the dense `S` when `cfg.refine`.
     fn s_solve(&self, rhs: &[Number]) -> Option<Vec<Number>> {
+        use pounce_common::observed::{Operation, Path, Primitive};
+        let operation = Operation::begin(Path::SchurS, Primitive::Backsolve, 1, if self.cfg.refine { self.cfg.refine_max_steps } else { 0 }).ok()?;
+        let result = 
         match (self.cfg.refine, self.s_matrix.as_ref()) {
-            (true, Some(m)) => self.s_solver.solve_refined(m, rhs),
+            (true, Some(m)) => self.s_solver.solve_refined_opts(m, rhs, feral::RefineOptions::with_max_steps(self.cfg.refine_max_steps)),
             _ => self.s_solver.solve(rhs),
         }
-        .ok()
+        .ok();
+        if operation.finish(result.is_some()) { result } else { None }
     }
 
     fn pivot_below_floor(&self, solver: &Solver) -> bool {
@@ -601,6 +632,24 @@ mod tests {
         assert!(err < 1e-8, "solution mismatch: {err:e}");
     }
 
+
+    struct Observed(std::cell::RefCell<Vec<pounce_common::observed::Event>>);
+    impl pounce_common::observed::Observer for Observed {
+        fn bind_layout(&self, _: &pounce_common::observed::Layout) -> Result<Option<Vec<usize>>, pounce_common::observed::Abort> { Ok(None) }
+        fn event(&self, event:&pounce_common::observed::Event) -> Result<(),pounce_common::observed::Abort> { self.0.borrow_mut().push(event.clone()); Ok(()) }
+    }
+    #[test]
+    fn observed_schur_reports_actual_two_factors_and_primitive_backsolves() {
+        use pounce_common::observed::{Scope, Event, Primitive, Path};
+        let observer=std::rc::Rc::new(Observed(std::cell::RefCell::new(Vec::new())));
+        let _scope=Scope::enter(observer.clone());
+        run_and_check(6,2,2,false,&schur_indices_tail(6,2));
+        let events=observer.0.borrow();
+        assert_eq!(events.iter().filter(|e| matches!(e,Event::Begin {path:Path::SchurF|Path::SchurS,primitive:Primitive::Factor,..})).count(),2);
+        assert!(events.iter().any(|e| matches!(e,Event::End {path:Path::SchurS,primitive:Primitive::Factor,succeeded:true})));
+        assert!(events.iter().any(|e| matches!(e,Event::Begin {path:Path::SchurF,primitive:Primitive::Backsolve,rhs:2,..})));
+        assert!(events.iter().any(|e| matches!(e,Event::Storage {opaque:true,..})));
+    }
     #[test]
     fn spd_ff_tail_partition_matches_oracle() {
         run_and_check(6, 2, 2, false, &schur_indices_tail(6, 2));

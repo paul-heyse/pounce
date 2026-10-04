@@ -87,9 +87,11 @@ impl SchurAugSystemSolver {
         let n_s = self.schur_indices.len();
         let d = dim as usize;
         if n_s == 0 || n_s >= d {
+            let _ = pounce_common::observed::event(pounce_common::observed::Event::Selected { schur: false, reason: "empty-or-full-separator" });
             return;
         }
         if (n_s as f64) / (d as f64) > self.max_schur_frac {
+            let _ = pounce_common::observed::event(pounce_common::observed::Event::Selected { schur: false, reason: "separator-too-large" });
             tracing::warn!(
                 target: "pounce::kkt",
                 n_schur = n_s, dim = d, max_frac = self.max_schur_frac,
@@ -108,6 +110,7 @@ impl SchurAugSystemSolver {
             .initialize_structure(dim, &irn, &jcn, &self.schur_indices);
         if st == ESymSolverStatus::Success {
             self.use_schur = true;
+            let _ = pounce_common::observed::event(pounce_common::observed::Event::Selected { schur: true, reason: "admitted-partition" });
         } else {
             tracing::warn!(
                 target: "pounce::kkt",
@@ -258,6 +261,7 @@ impl AugSystemSolver for SchurAugSystemSolver {
         }
         let dim = self.inner.assembled_dim();
         self.decide(dim);
+        if pounce_common::observed::abort().is_some() { return ESymSolverStatus::FatalError; }
 
         if self.use_schur {
             let st = self.schur_solve_one(rhs, sol, check_neg_evals, num_neg_evals);
@@ -268,6 +272,8 @@ impl AugSystemSolver for SchurAugSystemSolver {
                 // sees a spurious failure and gets correct full-system
                 // regularization for the rest of the run.
                 _ => {
+                    if pounce_common::observed::abort().is_some() { return ESymSolverStatus::FatalError; }
+                    if pounce_common::observed::event(pounce_common::observed::Event::Selected { schur: false, reason: "schur-numerical-failure" }).is_err() { return ESymSolverStatus::FatalError; }
                     tracing::warn!(
                         target: "pounce::kkt",
                         status = ?st,

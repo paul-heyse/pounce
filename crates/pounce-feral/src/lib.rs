@@ -1105,15 +1105,19 @@ impl FeralSolverInterface {
     /// convention). Rank deficiency (zero pivots) is reported as
     /// `Singular` so the outer loop routes to `perturb_for_singular`.
     fn factor(&mut self, check_neg_evals: bool, number_of_neg_evals: Index) -> ESymSolverStatus {
+        use pounce_common::observed::{Operation, Path, Primitive};
+        if !self.refresh_matrix() { return ESymSolverStatus::FatalError; }
+        let Ok(operation) = Operation::begin(Path::Monolithic, Primitive::Factor, 0, 0) else { return ESymSolverStatus::FatalError; };
+        let status = self.factor_unobserved(check_neg_evals, number_of_neg_evals);
+        if operation.finish(status == ESymSolverStatus::Success) { status } else { ESymSolverStatus::FatalError }
+    }
+    fn factor_unobserved(&mut self, check_neg_evals: bool, number_of_neg_evals: Index) -> ESymSolverStatus {
         // The matrix is retained across calls for refinement in backsolve
         // and as the refill destination, so it is in place before the
         // factorization rather than after it — the caller may still issue
         // solves against a stale factor in some restart paths, and this
         // keeps that matrix consistent with the values just supplied
         // regardless of the factor outcome.
-        if !self.refresh_matrix() {
-            return ESymSolverStatus::FatalError;
-        }
         let matrix = self.matrix.as_ref().expect("refresh_matrix stored one");
 
         let status = self.solver.factor(matrix, None);
@@ -1212,10 +1216,15 @@ impl FeralSolverInterface {
     }
 
     fn backsolve(&mut self, nrhs: Index, rhs_vals: &mut [Number]) -> ESymSolverStatus {
+        use pounce_common::observed::{Operation, Path, Primitive};
+        let Ok(operation) = Operation::begin(Path::Monolithic, Primitive::Backsolve, nrhs as usize, if self.refine { self.refine_max_steps } else { 0 }) else { return ESymSolverStatus::FatalError; };
+        let status = self.backsolve_unobserved(nrhs, rhs_vals);
+        if operation.finish(status == ESymSolverStatus::Success) { status } else { ESymSolverStatus::FatalError }
+    }
+    fn backsolve_unobserved(&mut self, nrhs: Index, rhs_vals: &mut [Number]) -> ESymSolverStatus {
         let n = self.dim as usize;
         let nrhs = nrhs as usize;
         debug_assert_eq!(rhs_vals.len(), n * nrhs);
-
         // feral#178 shipped the `_into` forms in 0.17.0, so the owned
         // `Vec` every entry point used to return — and the allocation
         // behind it — is gone. `x_scratch` is grown once and reused;
@@ -1363,6 +1372,10 @@ impl SparseSymLinearSolverInterface for FeralSolverInterface {
         ia: &[Index],
         ja: &[Index],
     ) -> ESymSolverStatus {
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {
+            owner: "monolithic-factor", known_bytes: (dim.max(0) as usize).saturating_add(nonzeros.max(0) as usize).saturating_mul(64), opaque: true,
+        }).is_err() { return ESymSolverStatus::FatalError; }
+
         assert_eq!(ia.len(), nonzeros as usize);
         assert_eq!(ja.len(), nonzeros as usize);
 
@@ -1958,7 +1971,7 @@ mod tests {
 
         // The IPM asks for one negative eigenvalue; the matrix has none,
         // so the count mismatches and the floor is consulted.
-        let mut solve_with = |cfg: FeralConfig| {
+        let solve_with = |cfg: FeralConfig| {
             let mut s = FeralSolverInterface::with_config(cfg);
             assert_eq!(
                 s.initialize_structure(N as Index, nnz, &irn, &jcn),

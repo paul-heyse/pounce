@@ -34,3 +34,5 @@ pub use reg_options::{DefaultValue, OptionType, RegisteredOption, RegisteredOpti
 pub use tagged::{Tag, TaggedCell, TaggedObject};
 pub use timing::{Deadline, DeadlineKind, TimedTask, TimingStatistics};
 pub use types::{Index, NLP_LOWER_BOUND_INF, NLP_UPPER_BOUND_INF, Number};
+
+pub mod observed;

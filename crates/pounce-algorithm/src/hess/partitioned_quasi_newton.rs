@@ -769,6 +769,7 @@ fn update_element(
 }
 
 impl HessianUpdater for PartitionedQuasiNewtonUpdater {
+    fn partitioned_stats(&self) -> Option<PartitionStats> { self.space.as_ref().map(|_| self.stats) }
     fn update_hessian(&mut self, data: &IpoptDataHandle, cq: &IpoptCqHandle) -> bool {
         let (curr_x, curr_y_c, curr_y_d) = match data.borrow().curr.as_ref() {
             Some(c) => (c.x.clone(), c.y_c.clone(), c.y_d.clone()),

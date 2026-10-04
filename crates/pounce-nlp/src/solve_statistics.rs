@@ -121,6 +121,11 @@ pub struct SolveStatistics {
     /// (pounce#86). `0.0` on the barrier-free SQP path, where μ has
     /// no meaning.
     pub final_mu: Number,
+    /// Actual partitioned elements, -1 when the mode never built its elements.
+    pub partitioned_elements: Index,
+    pub partitioned_dense_elements: Index,
+    pub partitioned_diagonal_elements: Index,
+    pub partitioned_stored_reals: Index,
 
     // ---- Restoration-phase audit counters (pounce#12). ----
     //
@@ -327,6 +332,10 @@ impl Default for SolveStatistics {
             final_unscaled_kkt_error: Number::NAN,
             final_kkt_error_above_noise: Number::NAN,
             final_mu: 0.0,
+            partitioned_elements: -1,
+            partitioned_dense_elements: 0,
+            partitioned_diagonal_elements: 0,
+            partitioned_stored_reals: 0,
             // -1 = the finite-difference updater never built a pattern,
             // which is every run that is not `hessian_approximation=
             // finite-difference`. Distinct from 0, a real pattern source.

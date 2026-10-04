@@ -566,6 +566,7 @@ pub struct IpoptApplication {
     /// so a stray hook never breaks a solve. Persistent config (not
     /// auto-cleared). Wire-set via [`Self::set_kkt_schur_block`].
     kkt_schur_block: Option<Vec<usize>>,
+    effective_feral_config: Option<pounce_feral::FeralConfig>,
     /// The problem-statistics block most recently printed during the current
     /// run, so a retry attempt does not reprint an identical one.
     ///
@@ -681,6 +682,7 @@ impl IpoptApplication {
             warm_start_diag: RefCell::new(None),
             external_ordering: None,
             kkt_schur_block: None,
+            effective_feral_config: None,
             last_printed_problem_stats: RefCell::new(None),
             in_retry_sequence: std::cell::Cell::new(false),
             end_verdict_deferrals: std::cell::Cell::new(0),
@@ -1908,6 +1910,11 @@ impl IpoptApplication {
     /// large a fraction of the system, malformed, or a backend error), so a
     /// stray hook never breaks a solve. Persistent config (not auto-cleared);
     /// drop it via [`Self::clear_kkt_schur_block`].
+    /// Inject one effective typed configuration into Schur and default factors.
+    pub fn set_effective_feral_config(&mut self, config: pounce_feral::FeralConfig) {
+        self.effective_feral_config = Some(config);
+    }
+
     pub fn set_kkt_schur_block(&mut self, indices: Vec<usize>) {
         self.kkt_schur_block = Some(indices);
     }
@@ -2397,6 +2404,7 @@ impl IpoptApplication {
         // one arm and relaxed on the other. That is a different problem, not a
         // different trajectory on one.
         let (lo_inf, up_inf, fixed_treatment) = self.adapter_options();
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage { owner: "pounce-classification-algorithm-factors", known_bytes: 0, opaque: true }).is_err() { self.timing.borrow().overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
         let adapter = match TNLPAdapter::new_with_options(
             Rc::clone(&tnlp),
             lo_inf,
@@ -4361,6 +4369,7 @@ impl IpoptApplication {
         // `make_parameter` would leave `n_x_var < n_c` — mirrors upstream
         // `IpTNLPAdapter.cpp:623-633`).
         let (lo_inf, up_inf, fixed_treatment) = self.adapter_options();
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage { owner: "pounce-classification-algorithm-factors", known_bytes: 0, opaque: true }).is_err() { timing.overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
         let adapter = match TNLPAdapter::new_with_options(
             Rc::clone(&tnlp),
             lo_inf,
@@ -4373,6 +4382,24 @@ impl IpoptApplication {
                 return ApplicationReturnStatus::InvalidProblemDefinition;
             }
         };
+        // Bidirectional layout binding happens after actual fixed-variable fallback
+        // classification and before any algorithm builder consumes the separator.
+        let classification = adapter.borrow().classification().clone();
+        let layout = pounce_common::observed::Layout {
+            x: classification.x_not_fixed_map.iter().map(|i| *i as usize).collect(),
+            c: classification.c_map.iter().map(|i| *i as usize).collect(),
+            d: classification.d_map.iter().map(|i| *i as usize).collect(),
+            full_to_x: classification.full_to_var.clone(),
+            full_to_c: classification.full_to_c.clone(),
+            full_to_d: classification.full_to_d.clone(),
+            fixed_removed: classification.x_fixed_map.iter().map(|i| *i as usize).collect(),
+            relaxed_fixed: adapter.borrow().effective_fixed_treatment() == FixedVarTreatment::RelaxBounds,
+        };
+        match pounce_common::observed::bind_layout(&layout) {
+            Ok(Some(indices)) => self.kkt_schur_block = Some(indices),
+            Ok(None) => {},
+            Err(_) => { timing.overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
+        }
         // Carry the user's constant `obj_scaling_factor` (default 1.0;
         // negative ⇒ maximize) into the NLP. Until pounce#128's
         // follow-up this option was registered but never read, so it
@@ -4584,7 +4611,7 @@ impl IpoptApplication {
         // `OptionsList` that drove the IPM-level builder above so
         // per-problem `.opt` files can flip backend knobs without
         // rebuilding pounce.
-        let mut feral_cfg = feral_config_from_options(&self.options);
+        let mut feral_cfg = self.effective_feral_config.clone().unwrap_or_else(|| feral_config_from_options(&self.options));
         // Block-triangular / Schur KKT partition (pounce#180 item 2). Configure
         // the Schur block solvers from the *base* feral cfg: a full-KKT external
         // ordering (item 1) is sized for the whole system and cannot apply to
@@ -4884,6 +4911,12 @@ impl IpoptApplication {
             // every other updater, which leaves the `-1` sentinel in
             // place and says "this mode did not run" rather than "it ran
             // and found nothing".
+            if let Some(partitioned) = alg.bundle.hess.partitioned_stats() {
+                stats.partitioned_elements = partitioned.elements as Index;
+                stats.partitioned_dense_elements = partitioned.dense_elements as Index;
+                stats.partitioned_diagonal_elements = partitioned.diagonal_elements as Index;
+                stats.partitioned_stored_reals = partitioned.stored_reals as Index;
+            }
             if let Some(fd) = alg.bundle.hess.fd_hessian_stats() {
                 use crate::hess::fd_hessian::FdPatternSource;
                 stats.fd_hessian_pattern_used = match fd.pattern_used {

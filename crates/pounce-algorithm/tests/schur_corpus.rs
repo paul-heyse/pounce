@@ -245,3 +245,47 @@ fn schur_matches_full_space_small() {
 fn schur_matches_full_space_medium() {
     parity_case(600, 10);
 }
+
+struct ActualObservation {
+    layout: RefCell<Option<pounce_common::observed::Layout>>,
+    events: RefCell<Vec<pounce_common::observed::Event>>,
+    refuse: bool,
+}
+impl pounce_common::observed::Observer for ActualObservation {
+    fn bind_layout(&self, layout: &pounce_common::observed::Layout) -> Result<Option<Vec<usize>>, pounce_common::observed::Abort> {
+        *self.layout.borrow_mut()=Some(layout.clone());
+        Ok(Some(vec![layout.row_index(0).unwrap()]))
+    }
+    fn event(&self,event:&pounce_common::observed::Event)->Result<(),pounce_common::observed::Abort> {
+        self.events.borrow_mut().push(event.clone());
+        if self.refuse && matches!(event,pounce_common::observed::Event::Begin {path:pounce_common::observed::Path::SchurF,..}) {return Err(pounce_common::observed::Abort::Resource("test admission".into()));}
+        Ok(())
+    }
+}
+#[test]
+fn observed_application_binds_actual_layout_before_schur_and_terminal_abort_never_falls_back() {
+    use pounce_common::observed::{Scope,Event,Path,Primitive};
+    for refuse in [false,true] {
+        let observer=Rc::new(ActualObservation {layout:RefCell::new(None),events:RefCell::new(Vec::new()),refuse});
+        let scope=Scope::enter(observer.clone());
+        let mut app=IpoptApplication::new();
+        app.options_mut().set_string_value("linear_solver","feral",true,false).unwrap();
+        app.options_mut().set_string_value("mu_strategy_fallback","no",true,false).unwrap();
+        app.options_mut().set_integer_value("max_iter",50,true,false).unwrap();
+        app.set_effective_feral_config(pounce_feral::FeralConfig {scaling:pounce_feral::ScalingStrategy::Mc64Symmetric,increase_quality:false,..Default::default()});
+        app.initialize().unwrap();
+        let status=app.optimize_tnlp_without_presolve(Rc::new(RefCell::new(ConvexQp::new(12,2))));
+        let layout=observer.layout.borrow();let layout=layout.as_ref().unwrap();
+        assert_eq!(layout.dimension(),14);
+        assert_eq!(layout.row_index(0),Some(12));
+        let events=observer.events.borrow();
+        assert!(events.iter().any(|event|matches!(event,Event::Begin {path:Path::SchurF,primitive:Primitive::Factor,..})));
+        if refuse {
+            assert!(scope.abort().is_some());
+            assert!(!events.iter().any(|event|matches!(event,Event::Begin {path:Path::Monolithic,primitive:Primitive::Factor,..})));
+            assert_ne!(status,ApplicationReturnStatus::SolveSucceeded);
+        } else {
+            assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::SchurS,primitive:Primitive::Factor,succeeded:true})));
+        }
+    }
+}
