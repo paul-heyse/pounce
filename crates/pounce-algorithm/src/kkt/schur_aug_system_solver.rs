@@ -320,3 +320,45 @@ impl AugSystemSolver for SchurAugSystemSolver {
         self.inner.resolve(coeffs, rhs, sol)
     }
 }
+
+#[cfg(test)]
+mod observed_tests {
+    use super::*;
+    use pounce_common::observed::{Event,Observer,Scope,Path,Primitive,StorageScope};
+    use pounce_linalg::{dense_vector::DenseVectorSpace,triplet::{SymTMatrix,SymTMatrixSpace,GenTMatrix,GenTMatrixSpace}};
+    struct Observe {events:std::cell::RefCell<Vec<Event>>,deny_fallback:bool}
+    impl Observer for Observe {
+        fn bind_layout(&self,_:&pounce_common::observed::Layout)->Result<Option<Vec<usize>>,pounce_common::observed::Abort>{Ok(None)}
+        fn event(&self,event:&Event)->Result<(),pounce_common::observed::Abort>{
+            self.events.borrow_mut().push(event.clone());
+            if self.deny_fallback && matches!(event,Event::Begin {path:Path::Monolithic,primitive:Primitive::Factor,..}) {return Err(pounce_common::observed::Abort::Resource("fallback work refusal".into()));}
+            Ok(())
+        }
+    }
+    #[test]
+    fn observed_bounded_failed_ff_keeps_schur_storage_while_admitting_fallback() {
+        for deny_fallback in [false,true] {
+            let observer=Rc::new(Observe {events:std::cell::RefCell::new(Vec::new()),deny_fallback});let scope=Scope::enter(observer.clone());
+            pounce_common::observed::set_linear_maximum(Some(7));
+            let cfg=FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
+            let inner=StdAugSystemSolver::new(pounce_linsol::TSymLinearSolver::new(Box::new(pounce_feral::FeralSolverInterface::with_config(cfg.clone())),None,false));
+            let mut solver=SchurAugSystemSolver::new(inner,vec![2],cfg);
+            let mut w=SymTMatrix::new(SymTMatrixSpace::new(2,vec![1,2],vec![1,2]));w.set_values(&[0.0,2.0]);
+            let mut jc=GenTMatrix::new(GenTMatrixSpace::new(1,2,vec![1],vec![1]));jc.set_values(&[1.0]);
+            let jd=GenTMatrix::new(GenTMatrixSpace::new(0,2,vec![],vec![]));
+            let xs=DenseVectorSpace::new(2);let cs=DenseVectorSpace::new(1);let zs=DenseVectorSpace::new(0);
+            let mut rx=xs.make_new_dense();rx.set_values(&[1.0,2.0]);let mut rc=cs.make_new_dense();rc.set_values(&[1.0]);let rz=zs.make_new_dense();
+            let mut sx=xs.make_new_dense();let mut sc=cs.make_new_dense();let mut ss=zs.make_new_dense();let mut sd=zs.make_new_dense();
+            let coeffs=AugSysCoeffs {w:Some(&w),w_factor:1.0,d_x:None,delta_x:0.0,d_s:None,delta_s:0.0,j_c:&jc,d_c:None,delta_c:0.0,j_d:&jd,d_d:None,delta_d:0.0};
+            let rhs=AugSysRhs {rhs_x:&rx,rhs_s:&rz,rhs_c:&rc,rhs_d:&rz};let mut sol=AugSysSol {sol_x:&mut sx,sol_s:&mut ss,sol_c:&mut sc,sol_d:&mut sd};
+            let status=solver.solve(&coeffs,&rhs,&mut sol,false,0);
+            assert_eq!(solver.schur.schur_dim(),1,"Schur owner remains live through fallback: {status:?} {:?} {:?}",scope.abort(),observer.events.borrow());
+            let events=observer.events.borrow();
+            assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::SchurF,primitive:Primitive::Factor,succeeded:false})));
+            assert!(events.iter().any(|event|matches!(event,Event::Storage {scope:StorageScope::Linear,owner:"schur-factors-coupling-separator-refinement",opaque:false,..})));
+            assert!(events.iter().any(|event|matches!(event,Event::Storage {scope:StorageScope::Linear,owner:"monolithic-factor",opaque:false,..})));
+            if deny_fallback {assert_eq!(status,ESymSolverStatus::FatalError);assert!(scope.abort().is_some());assert!(!events.iter().any(|event|matches!(event,Event::End {path:Path::Monolithic,primitive:Primitive::Factor,..})));}
+            else {assert_eq!(status,ESymSolverStatus::Success);assert_eq!(sx.values(),&[1.0,1.0]);assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::Monolithic,primitive:Primitive::Factor,succeeded:true})));}
+        }
+    }
+}

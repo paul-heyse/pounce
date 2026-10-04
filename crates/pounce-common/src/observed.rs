@@ -20,14 +20,16 @@ impl Layout {
     pub fn row_index(&self, original: usize) -> Option<usize> {
         let c = *self.full_to_c.get(original)?;
         if c >= 0 { Some(self.x.len() + self.d.len() + c as usize) }
-        else { let d = *self.full_to_d.get(original)?; (d >= 0).then_some(self.x.len() + self.d.len() + self.c.len() + d as usize) }
+        else { let d = *self.full_to_d.get(original)?; if d>=0 {Some(self.x.len() + self.d.len() + self.c.len() + d as usize)} else {None} }
     }
 }
+#[derive(Clone, Debug)]
+pub enum StorageScope { Application, Linear }
 #[derive(Clone, Debug)]
 pub enum Event {
     /// Before allocation. Extent describes known owner buffers; opaque=true is an
     /// explicit request for a complete foreign reservation, never a complete estimate.
-    Storage { owner: &'static str, known_bytes: usize, opaque: bool },
+    Storage { scope: StorageScope, owner: &'static str, known_bytes: usize, opaque: bool },
     Begin { path: Path, primitive: Primitive, rhs: usize, refinement_bound: usize },
     End { path: Path, primitive: Primitive, succeeded: bool },
     Selected { schur: bool, reason: &'static str },
@@ -37,28 +39,31 @@ pub trait Observer {
     fn event(&self, event: &Event) -> Result<(), Abort>;
 }
 #[derive(Default)]
-struct State { observer: Option<Rc<dyn Observer>>, abort: Option<Abort> }
+struct State { observer: Option<Rc<dyn Observer>>, abort: Option<Abort>, linear_maximum: Option<usize> }
 thread_local! { static ACTIVE: RefCell<State> = RefCell::new(State::default()); }
 pub struct Scope { previous: Option<State> }
 impl Scope {
     pub fn enter(observer: Rc<dyn Observer>) -> Self {
-        let previous = ACTIVE.with(|state| state.replace(State { observer: Some(observer), abort: None }));
+        let previous = ACTIVE.with(|state| state.replace(State { observer: Some(observer), abort: None, linear_maximum: None }));
         Self { previous: Some(previous) }
     }
     pub fn abort(&self) -> Option<Abort> { abort() }
 }
 impl Drop for Scope { fn drop(&mut self) { if let Some(previous) = self.previous.take() { ACTIVE.with(|state| {state.replace(previous);}); } } }
+pub fn set_linear_maximum(maximum:Option<usize>) { ACTIVE.with(|state|state.borrow_mut().linear_maximum=maximum); }
+pub fn linear_maximum()->Option<usize> {ACTIVE.with(|state|state.borrow().linear_maximum)}
+pub fn reject(error:Abort) { ACTIVE.with(|state| {let mut state=state.borrow_mut();if state.abort.is_none(){state.abort=Some(error);}}); }
 pub fn abort() -> Option<Abort> { ACTIVE.with(|state| state.borrow().abort.clone()) }
-fn invoke<T>(f: impl FnOnce(&dyn Observer) -> Result<T, Abort>, default: T) -> Result<T, Abort> {
+fn invoke<T>(allow_after_abort: bool, f: impl FnOnce(&dyn Observer) -> Result<T, Abort>, default: T) -> Result<T, Abort> {
     let (observer, stopped) = ACTIVE.with(|state| { let state=state.borrow(); (state.observer.clone(),state.abort.clone()) });
-    if let Some(stopped)=stopped { return Err(stopped); }
+    if !allow_after_abort { if let Some(stopped)=stopped { return Err(stopped); } }
     let Some(observer)=observer else { return Ok(default); };
     let result=catch_unwind(AssertUnwindSafe(|| f(observer.as_ref()))).unwrap_or(Err(Abort::Panic));
-    if let Err(error)=&result { ACTIVE.with(|state| state.borrow_mut().abort=Some(error.clone())); }
+    if let Err(error)=&result { reject(error.clone()); }
     result
 }
-pub fn event(event: Event) -> Result<(), Abort> { invoke(|observer| observer.event(&event), ()) }
-pub fn bind_layout(layout: &Layout) -> Result<Option<Vec<usize>>, Abort> { invoke(|observer| observer.bind_layout(layout), None) }
+pub fn event(event: Event) -> Result<(), Abort> { invoke(matches!(event,Event::End {..}), |observer| observer.event(&event), ()) }
+pub fn bind_layout(layout: &Layout) -> Result<Option<Vec<usize>>, Abort> { invoke(false, |observer| observer.bind_layout(layout), None) }
 /// Owner-side scope: admission precedes arithmetic; failed early returns remain observed.
 pub struct Operation { path: Path, primitive: Primitive, ended: bool }
 impl Operation {

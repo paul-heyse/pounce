@@ -1,0 +1,919 @@
+//! C ABI for embedding feral as Ipopt's `linear_solver=feral`.
+//!
+//! Designed to be the minimum surface Ipopt's
+//! `SparseSymLinearSolverInterface` plug-in shape requires. The C++
+//! shim at `feral-ipopt-shim/` is the only intended consumer.
+//!
+//! Matrix format: matches Ipopt's `CSR_Format_0_Offset` — upper-
+//! triangle CSR with 0-based indices. For a symmetric matrix this is
+//! byte-identical to feral's `CscMatrix` (lower-triangle CSC); the
+//! shim hands us Ipopt's `ia`/`ja` arrays unchanged. See
+//! `dev/research/feral-ipopt-c-shim.md` §"Matrix format".
+//!
+//! Status codes are NOT a numeric mirror of Ipopt's `ESymSolverStatus`
+//! enum (`ref/Ipopt/src/Algorithm/LinearSolvers/IpSymLinearSolver.hpp:19-33`).
+//! Only codes 0-2 share Ipopt's values — `SYMSOLVER_SUCCESS`,
+//! `SYMSOLVER_SINGULAR`, `SYMSOLVER_WRONG_INERTIA`. FERAL has no
+//! `CALL_AGAIN` analog (Ipopt's enum value 3), so `FERAL_FATAL` reuses
+//! value 3 and collides with `SYMSOLVER_CALL_AGAIN` — Ipopt's own fatal
+//! code is `SYMSOLVER_FATAL_ERROR` (value 4). The shim MUST therefore
+//! translate `FERAL_FATAL`, not cast it: `feral-ipopt-shim/src/
+//! IpFeralSolverInterface.cpp:11-15` maps `FERAL_FATAL` →
+//! `SYMSOLVER_FATAL_ERROR` explicitly. A pass-through cast would
+//! mis-report fatal errors as call-again and loop. See X8 in
+//! `dev/research/repo-review-2026-06-09.md`.
+
+use crate::numeric::factorize::NumericParams;
+use crate::scaling::ScalingStrategy;
+use crate::symbolic::supernode::SupernodeParams;
+use crate::{CscMatrix, FactorStatus, Solver};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+pub const FERAL_SUCCESS: i32 = 0;
+pub const FERAL_SINGULAR: i32 = 1;
+pub const FERAL_WRONG_INERTIA: i32 = 2;
+pub const FERAL_FATAL: i32 = 3;
+
+/// Opaque handle.
+pub struct FeralSolver {
+    solver: Solver,
+    matrix: Option<CscMatrix>,
+    /// Negative-eigenvalue count of the *current* valid factor, or `-1` when
+    /// no valid factor exists (fresh handle, after `feral_set_structure`, or
+    /// after a `feral_factor` that returned `FERAL_SINGULAR`/`FERAL_FATAL`).
+    /// The sentinel keeps a failed re-factor from leaking the previous
+    /// matrix's inertia through `feral_num_neg` (X1).
+    neg_evals: i32,
+}
+
+/// Create a new solver handle. Returns null on panic.
+///
+/// Honored environment variables (all read once at construction):
+///   - `FERAL_CASCADE_BREAK` = `1`/`on`/`true`/`yes` — opt into the
+///     legacy `ratio=0.5, eps=1e-10` cascade-break configuration
+///     (off by default after 585d739). Required for ipopt-feral
+///     parity with pounce-feral.
+///   - `FERAL_SCALING` = `identity`/`infnorm`/`mc64`/`auto` (alias
+///     `adaptive`) — override the default scaling strategy.
+///     Case-insensitive. The vocabulary is kept in lockstep with the
+///     bench harness (`src/bin/bench.rs`), which spells adaptive
+///     routing `adaptive`; both spellings select
+///     `ScalingStrategy::Auto` here so a cross-tool experiment with one
+///     spelling measures the same configuration. Used for task #68
+///     (clnlbeam IPM iter bloat investigation) to test whether
+///     MC64-vs-other scaling changes the IPM trajectory.
+///   - `FERAL_PARALLEL` = `0`/`off`/`false`/`no` — disable parallel
+///     multifrontal factorization (single-threaded). Used to test
+///     parallel-reduction-order non-reproducibility.
+///     `1`/`on`/`true`/`yes` forces it *on*, overriding the
+///     platform-derived default (issue #154). Needed on hosts whose
+///     threads std cannot see — a wasm-bindgen-rayon page that stood
+///     up its own worker pool — where `available_parallelism()`
+///     reports `Err` and the default is therefore sequential. Unset
+///     leaves the default alone.
+///   - `FERAL_PIVTOL` = `<float>` — override `pivot_threshold` (default
+///     1e-8 matching MA27/ipopt's `ma27_pivtol`). Used to test
+///     whether tighter pivots (e.g. 0.01 MA57-canonical) change the
+///     IPM trajectory.
+///   - `FERAL_STATIC_PIVOT` = `<float>` — enable MA57-style static-
+///     pivot perturbation (issue #38). Sets
+///     `NumericParams::static_pivot_threshold`; the solver derives an
+///     absolute floor `t * ||D·A·D||_∞` from the *scaled* matrix norm
+///     (post-scaling; N2) and applies it to every accepted 1×1 / 2×2
+///     pivot. Off by
+///     default; recommended starting value `1e-8`. Bends small
+///     pivots toward the IPM's expected inertia and cuts
+///     PDPerturbationHandler δ_w escalation cost on problems like
+///     rocket_12800.
+///   - `FERAL_WARN_PARTIAL_SINGULAR` = `1`/`on`/`true`/`yes` — opt
+///     into a one-line stderr `warning:` whenever MC64 matching
+///     leaves variables unmatched (`ScalingInfo::PartialSingular`).
+///     Off by default (issue #43): `PartialSingular` is routine and
+///     benign for IPM hosts that factorize structurally rank-
+///     deficient KKT systems every iteration, so feral stays quiet
+///     as a library should. On the Rust API the same fact is
+///     always available structurally via `Solver::scaling_info`.
+#[no_mangle]
+pub extern "C" fn feral_new() -> *mut FeralSolver {
+    catch_unwind(|| {
+        let cb_on = matches!(
+            std::env::var("FERAL_CASCADE_BREAK").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes"),
+        );
+
+        let mut np = NumericParams::default();
+        let scaling_raw = std::env::var("FERAL_SCALING").unwrap_or_default();
+        if scaling_value_is_unrecognized(&scaling_raw) {
+            // Match the bench harness, which warns and keeps the default on a
+            // non-empty unrecognized value (X5 follow-up). Silent fallthrough
+            // would make a typo'd strategy look active.
+            eprintln!(
+                "warning: FERAL_SCALING=\"{}\" not recognized; falling back to default",
+                scaling_raw
+            );
+        }
+        if let Some(strategy) = scaling_strategy_from_env_value(&scaling_raw) {
+            np.scaling = strategy;
+        }
+        // Both parsed through `crate::env`, which warns on a value it
+        // cannot use instead of leaving the default silently in place
+        // (issue #176).
+        if let Some(v) = crate::env::f64_var_where("FERAL_PIVTOL", ">= 0", |v| v >= 0.0) {
+            np.bk.pivot_threshold = v;
+        }
+        if let Some(v) = crate::env::f64_var_where("FERAL_STATIC_PIVOT", "> 0", |v| v > 0.0) {
+            np.static_pivot_threshold = Some(v);
+        }
+        if matches!(
+            std::env::var("FERAL_WARN_PARTIAL_SINGULAR").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes"),
+        ) {
+            np.warn_partial_singular = true;
+        }
+
+        let mut solver = Solver::with_params(np, SupernodeParams::default());
+        if cb_on {
+            solver = solver.with_cascade_break(0.5).with_cascade_break_eps(1e-10);
+        } else {
+            // Warm-CB auto-arm. Default β=0.05 ≈ "5% of n got delayed
+            // at some supernode last call ⇒ arm CB for this call only."
+            // Wired here (not in Solver::new) because the auto-arm only
+            // makes sense in the IPM loop where the same Solver gets
+            // called repeatedly on the same pattern with drifting
+            // values. Disable by setting FERAL_AUTO_CB_BETA=0.
+            //
+            // Live evidence (2026-05-17): robot_1600 with CB=off takes
+            // 13.7 s due to delayed-pivot cascades (sum_delayed=60k on
+            // n=24000 in late-IPM iters); FERAL_CASCADE_BREAK=on cuts
+            // it to 2.4 s (5.6×). The auto-arm gives the same rescue
+            // without per-problem opt-in.
+            let beta = crate::env::f64_var_where("FERAL_AUTO_CB_BETA", ">= 0", |v| v >= 0.0)
+                .unwrap_or(0.05);
+            if beta > 0.0 {
+                solver = solver.with_auto_cascade_break(beta);
+            }
+        }
+        // Issue #154: two-sided now that the default is derived from
+        // the platform rather than hardcoded on. An unset (or
+        // unrecognized) value leaves the derived default in place.
+        match std::env::var("FERAL_PARALLEL").as_deref() {
+            Ok("0") | Ok("off") | Ok("false") | Ok("no") => {
+                solver = solver.with_parallel(false);
+            }
+            Ok("1") | Ok("on") | Ok("true") | Ok("yes") => {
+                solver = solver.with_parallel(true);
+            }
+            _ => {}
+        }
+
+        Box::into_raw(Box::new(FeralSolver {
+            solver,
+            matrix: None,
+            // -1 = no valid factor yet (X1).
+            neg_evals: -1,
+        }))
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Parse a `FERAL_SCALING` value into a scaling-strategy override,
+/// returning `None` for the empty string or an unrecognized value (the
+/// caller then keeps the default). Split out as a pure helper so the
+/// C-ABI shim's vocabulary is unit-testable and stays in lockstep with
+/// the bench harness's parser (`src/bin/bench.rs`).
+///
+/// X5 (`dev/research/repo-review-2026-06-09.md`).
+fn scaling_strategy_from_env_value(s: &str) -> Option<ScalingStrategy> {
+    match s.to_lowercase().as_str() {
+        "" => None,
+        "identity" => Some(ScalingStrategy::Identity),
+        "infnorm" => Some(ScalingStrategy::InfNorm),
+        "mc64" => Some(ScalingStrategy::Mc64Symmetric),
+        // `auto` and `adaptive` are two spellings of the same adaptive
+        // routing; bench accepts `adaptive`, so accept both here (X5).
+        "auto" | "adaptive" => Some(ScalingStrategy::Auto),
+        _ => None, // unknown values keep the default (no override)
+    }
+}
+
+/// True when `FERAL_SCALING` is set to a *non-empty* value the shim does not
+/// recognize. The bench harness warns and falls back to default in this case
+/// (`scaling_strategy_from_str`'s `other` arm); the shim must do the same
+/// rather than silently ignore a typo'd strategy — otherwise an experiment
+/// measures the default while the operator believes a strategy is active, and
+/// the two tools diverge on identical input. Defined in terms of the single
+/// vocabulary source above, so it can never drift from what the shim accepts.
+fn scaling_value_is_unrecognized(s: &str) -> bool {
+    !s.is_empty() && scaling_strategy_from_env_value(s).is_none()
+}
+
+/// Free a solver handle. Null pointer is a no-op.
+///
+/// # Safety
+/// `s` must be a pointer previously returned by `feral_new` and not
+/// already freed.
+#[no_mangle]
+pub unsafe extern "C" fn feral_free(s: *mut FeralSolver) {
+    if s.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract — pointer came from `feral_new` and
+        // has not been freed. Box reclaims and drops the owned data.
+        drop(Box::from_raw(s));
+    }));
+}
+
+/// Store the matrix structure and allocate the internal values
+/// buffer. Returns `FERAL_SUCCESS` (0) or `FERAL_FATAL` (3).
+///
+/// `ia` must have length `n+1`; `ja` must have length `nnz`.
+/// The arrays follow Ipopt's `CSR_Format_0_Offset` convention:
+/// 0-based, upper triangle, sorted and deduplicated within each row.
+///
+/// # Safety
+/// `s` must come from `feral_new`. `ia` must point to at least `n+1`
+/// `i32`s; `ja` must point to at least `nnz` `i32`s.
+#[no_mangle]
+pub unsafe extern "C" fn feral_set_structure(
+    s: *mut FeralSolver,
+    n: i32,
+    nnz: i32,
+    ia: *const i32,
+    ja: *const i32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if s.is_null() || ia.is_null() || ja.is_null() || n < 0 || nnz < 0 {
+            return FERAL_FATAL;
+        }
+        // SAFETY: caller contract — `s` came from `feral_new`.
+        let s = &mut *s;
+        let n_usize = n as usize;
+        let nnz_usize = nnz as usize;
+        // SAFETY: caller contract — `ia` has at least n+1 entries.
+        let ia_slice = std::slice::from_raw_parts(ia, n_usize + 1);
+        // SAFETY: caller contract — `ja` has at least nnz entries.
+        let ja_slice = std::slice::from_raw_parts(ja, nnz_usize);
+
+        let col_ptr: Vec<usize> = ia_slice.iter().map(|&x| x as usize).collect();
+        let row_idx: Vec<usize> = ja_slice.iter().map(|&x| x as usize).collect();
+
+        let matrix = CscMatrix {
+            n: n_usize,
+            col_ptr,
+            row_idx,
+            values: vec![0.0; nnz_usize],
+        };
+
+        // Basic structural sanity check on what Ipopt handed us.
+        // Catches dimension mismatches and out-of-range indices.
+        if matrix.validate().is_err() {
+            return FERAL_FATAL;
+        }
+
+        s.matrix = Some(matrix);
+        // New structure invalidates any prior factor's inertia (X1).
+        s.neg_evals = -1;
+        // ...and the stored numeric factor itself (X9): a host that
+        // replaces the structure and then solves without re-factoring
+        // must fail cleanly, not reuse the previous structure's factor.
+        s.solver.invalidate_factors();
+        FERAL_SUCCESS
+    }))
+    .unwrap_or(FERAL_FATAL)
+}
+
+/// Return a pointer to the internal values buffer (length `nnz`).
+/// Caller writes A's nonzero values here in the same order as `ja`
+/// from the most recent `feral_set_structure`, then calls
+/// `feral_factor`. Returns null on error.
+///
+/// # Safety
+/// `s` must come from `feral_new` and have had `feral_set_structure`
+/// called successfully. The returned pointer is valid until the
+/// next `feral_set_structure` or `feral_free`.
+#[no_mangle]
+pub unsafe extern "C" fn feral_values_ptr(s: *mut FeralSolver) -> *mut f64 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract.
+        let s = &mut *s;
+        match &mut s.matrix {
+            Some(m) => m.values.as_mut_ptr(),
+            None => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// Factor the matrix currently in the values buffer.
+///
+/// If `check_neg != 0`, returns `FERAL_WRONG_INERTIA` when the
+/// number of negative eigenvalues disagrees with `expected_neg`.
+/// The factor is still stored — `feral_solve` may be called.
+///
+/// # Safety
+/// `s` must come from `feral_new` and have had
+/// `feral_set_structure` called successfully.
+#[no_mangle]
+pub unsafe extern "C" fn feral_factor(
+    s: *mut FeralSolver,
+    check_neg: i32,
+    expected_neg: i32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if s.is_null() {
+            return FERAL_FATAL;
+        }
+        // SAFETY: caller contract.
+        let s = &mut *s;
+        // Borrow the stored matrix rather than cloning it. `matrix` and
+        // `solver` are disjoint fields of `*s`, so `&s.matrix` coexists
+        // with `&mut s.solver` below — no O(nnz) clone per IPM iteration
+        // (X7). The earlier clone was a borrow-checker workaround that a
+        // split field borrow makes unnecessary.
+        let matrix = match &s.matrix {
+            Some(m) => m,
+            None => return FERAL_FATAL,
+        };
+        // Pass None for check_inertia — Ipopt only constrains
+        // negative-eigenvalue count, not positive. We do the
+        // negative-count check ourselves below.
+        let trace_factor = matches!(
+            std::env::var("FERAL_FACTOR_TRACE").as_deref(),
+            Ok("1") | Ok("on"),
+        );
+        let solve_t0 = if trace_factor {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let status = s.solver.factor(matrix, None);
+        if let Some(t0) = solve_t0 {
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let (sum_delayed, max_delayed, n_snodes) = match s.solver.factors() {
+                Some(f) => {
+                    let sum: usize = f.node_factors.iter().map(|nf| nf.n_delayed_in).sum();
+                    let max: usize = f
+                        .node_factors
+                        .iter()
+                        .map(|nf| nf.n_delayed_in)
+                        .max()
+                        .unwrap_or(0);
+                    (sum, max, f.node_factors.len())
+                }
+                None => (0, 0, 0),
+            };
+            eprintln!(
+                "[feral factor] n={} nnz={} {:.1} ms snodes={} sum_delayed={} max_delayed={} status={:?}",
+                matrix.n,
+                matrix.row_idx.len(),
+                ms,
+                n_snodes,
+                sum_delayed,
+                max_delayed,
+                status,
+            );
+        }
+        match status {
+            FactorStatus::Success => {
+                let inertia = match s.solver.inertia() {
+                    Some(i) => i.clone(),
+                    None => return FERAL_FATAL,
+                };
+                s.neg_evals = inertia.negative as i32;
+                if check_neg != 0 && s.neg_evals != expected_neg {
+                    FERAL_WRONG_INERTIA
+                } else {
+                    FERAL_SUCCESS
+                }
+            }
+            FactorStatus::Singular => {
+                // No valid inertia — invalidate so feral_num_neg cannot leak
+                // the previous factor's count on a failed re-factor (X1).
+                s.neg_evals = -1;
+                FERAL_SINGULAR
+            }
+            FactorStatus::WrongInertia { actual, .. } => {
+                // Solver::factor returns WrongInertia only when we
+                // pass check_inertia=Some, which we don't above.
+                // Defensive branch in case the implementation
+                // changes.
+                s.neg_evals = actual.negative as i32;
+                FERAL_WRONG_INERTIA
+            }
+            FactorStatus::FatalError(_) => {
+                // No valid inertia — invalidate (see Singular branch, X1).
+                s.neg_evals = -1;
+                FERAL_FATAL
+            }
+        }
+    }))
+    .unwrap_or(FERAL_FATAL)
+}
+
+/// Solve `A X = B` in place. `rhs` is column-major, length
+/// `n * nrhs`. On success the buffer holds X.
+///
+/// By default this routes through `Solver::solve_many_refined`: one
+/// round of iterative refinement against the original matrix held
+/// in `s.matrix`. This closes the residual floor that caused
+/// ipopt-feral to stall in the final-tail convergence on
+/// `robot_1600` (feral#17) and `NARX_CFy` (feral#18) — feral's
+/// inertia agrees with MA57 on those problems, but cascade-break's
+/// L-factor perturbation produces a per-pivot residual the IPM
+/// can't drive below the duality gap without refinement.
+///
+/// Opt out by setting `FERAL_REFINE=0` in the environment. With
+/// refinement disabled this is equivalent to `Solver::solve_many`.
+///
+/// # Safety
+/// `s` must come from `feral_new` and a successful `feral_factor`
+/// must have run since the most recent `feral_set_structure` /
+/// values fill. The values buffer must not have been modified
+/// between `feral_factor` and `feral_solve` (Ipopt's protocol).
+/// `rhs` must point to at least `n * nrhs` `f64`s.
+#[no_mangle]
+pub unsafe extern "C" fn feral_solve(s: *mut FeralSolver, nrhs: i32, rhs: *mut f64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if s.is_null() || rhs.is_null() || nrhs <= 0 {
+            return FERAL_FATAL;
+        }
+        // SAFETY: caller contract.
+        let s = &*s;
+        let matrix = match &s.matrix {
+            Some(m) => m,
+            None => return FERAL_FATAL,
+        };
+        let n = matrix.n;
+        let nrhs_usize = nrhs as usize;
+        // SAFETY: caller contract — `rhs` has at least n*nrhs entries.
+        let rhs_slice = std::slice::from_raw_parts_mut(rhs, n * nrhs_usize);
+
+        let refined = !matches!(
+            std::env::var("FERAL_REFINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no"),
+        );
+        let solved = if refined {
+            s.solver.solve_many_refined(matrix, rhs_slice, nrhs_usize)
+        } else {
+            s.solver.solve_many(rhs_slice, nrhs_usize)
+        };
+        match solved {
+            Ok(x) => {
+                rhs_slice.copy_from_slice(&x);
+                FERAL_SUCCESS
+            }
+            Err(_) => FERAL_FATAL,
+        }
+    }))
+    .unwrap_or(FERAL_FATAL)
+}
+
+/// Number of negative eigenvalues of the current valid factor. Returns -1
+/// when no valid factor is available: a fresh handle, after a structure
+/// change, or after a `feral_factor` that returned `FERAL_SINGULAR` or
+/// `FERAL_FATAL` (so a failed re-factor never leaks the previous matrix's
+/// count, X1).
+///
+/// # Safety
+/// `s` must come from `feral_new`.
+#[no_mangle]
+pub unsafe extern "C" fn feral_num_neg(s: *const FeralSolver) -> i32 {
+    if s.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract.
+        let s = &*s;
+        s.neg_evals
+    }))
+    .unwrap_or(-1)
+}
+
+/// Smallest accepted pivot magnitude `min|λ(D)|` of the most recently
+/// factored matrix — FERAL's near-singularity signal, the analog of
+/// MA57's `CNTL(2)` small-pivot threshold. Returns `-1.0` when no
+/// factor is available or `s` is null (a magnitude is non-negative by
+/// construction, so a negative return is an unambiguous "no value").
+///
+/// An IPM perturbation handler thresholds `feral_min_pivot(s) /
+/// feral_max_pivot(s)` — a scale-free ratio ≈ 1/κ(D) — to decide
+/// whether to treat the factor as singular and bump its Hessian
+/// perturbation, even when `feral_num_neg` reports the correct
+/// inertia. See `dev/research/near-singularity-signal.md`.
+///
+/// # Safety
+/// `s` must come from `feral_new`.
+#[no_mangle]
+pub unsafe extern "C" fn feral_min_pivot(s: *const FeralSolver) -> f64 {
+    if s.is_null() {
+        return -1.0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract.
+        let s = &*s;
+        s.solver.min_pivot_magnitude().unwrap_or(-1.0)
+    }))
+    .unwrap_or(-1.0)
+}
+
+/// Largest accepted pivot magnitude `max|λ(D)|` of the most recently
+/// factored matrix. Returns `-1.0` when no factor is available or `s`
+/// is null. Pair with [`feral_min_pivot`] to form the scale-free
+/// near-singularity ratio. See `dev/research/near-singularity-signal.md`.
+///
+/// # Safety
+/// `s` must come from `feral_new`.
+#[no_mangle]
+pub unsafe extern "C" fn feral_max_pivot(s: *const FeralSolver) -> f64 {
+    if s.is_null() {
+        return -1.0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller contract.
+        let s = &*s;
+        s.solver.max_pivot_magnitude().unwrap_or(-1.0)
+    }))
+    .unwrap_or(-1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// X5 (dev/research/repo-review-2026-06-09.md): the C-ABI shim must
+    /// accept the same `FERAL_SCALING` vocabulary as the bench harness
+    /// (`src/bin/bench.rs::scaling_strategy_from_str`), so a cross-tool
+    /// experiment with one spelling measures the same configuration in
+    /// both. `adaptive` is bench's spelling for `ScalingStrategy::Auto`;
+    /// before this fix the shim silently dropped it (→ default), so a
+    /// run with `FERAL_SCALING=adaptive` measured a *different* strategy
+    /// in the shim than in bench.
+    #[test]
+    fn scaling_vocabulary_matches_bench_harness() {
+        assert_eq!(
+            scaling_strategy_from_env_value("adaptive"),
+            Some(ScalingStrategy::Auto),
+            "`adaptive` must alias Auto to match bench"
+        );
+        assert_eq!(
+            scaling_strategy_from_env_value("auto"),
+            Some(ScalingStrategy::Auto)
+        );
+        // Case-insensitive, like bench's `to_lowercase()` parser.
+        assert_eq!(
+            scaling_strategy_from_env_value("ADAPTIVE"),
+            Some(ScalingStrategy::Auto)
+        );
+        assert_eq!(
+            scaling_strategy_from_env_value("identity"),
+            Some(ScalingStrategy::Identity)
+        );
+        assert_eq!(
+            scaling_strategy_from_env_value("infnorm"),
+            Some(ScalingStrategy::InfNorm)
+        );
+        assert_eq!(
+            scaling_strategy_from_env_value("mc64"),
+            Some(ScalingStrategy::Mc64Symmetric)
+        );
+        // Unset and typos fall through to the default (None override).
+        assert_eq!(scaling_strategy_from_env_value(""), None);
+        assert_eq!(scaling_strategy_from_env_value("mc46"), None);
+    }
+
+    /// X5 follow-up (repo-review-2026-06-09-verification.md residual): a
+    /// *non-empty* `FERAL_SCALING` outside the vocabulary must be flagged so
+    /// the shim warns and falls back to default, exactly as the bench harness
+    /// does (`scaling_strategy_from_str`'s `other` arm). Before this the shim
+    /// collapsed unset and typo'd values into the same silent `None`, so a
+    /// `FERAL_SCALING=mc46` experiment ran the default strategy while the
+    /// operator believed `mc46` was active — and bench (which warns) and the
+    /// shim (which was silent) diverged on the same input. Oracle: bench's
+    /// recognized/unrecognized partition of the vocabulary.
+    #[test]
+    fn unrecognized_scaling_value_is_flagged_for_warning() {
+        // Unset → not a warning case (keep the default silently).
+        assert!(!scaling_value_is_unrecognized(""));
+        // Every recognized spelling → not a warning case.
+        for ok in [
+            "identity", "infnorm", "mc64", "auto", "adaptive", "ADAPTIVE",
+        ] {
+            assert!(
+                !scaling_value_is_unrecognized(ok),
+                "`{ok}` is recognized; must not warn"
+            );
+        }
+        // A non-empty typo → flagged (the shim warns, like bench).
+        for bad in ["mc46", "infnrom", "garbage"] {
+            assert!(
+                scaling_value_is_unrecognized(bad),
+                "`{bad}` is unrecognized; must be flagged for a warning"
+            );
+        }
+    }
+
+    /// 2x2 indefinite `[[1,2],[2,1]]` (eigenvalues 3, -1) — RHS (3,3),
+    /// expected `x = (1, 1)`. CSR upper-triangle with 0-based indices:
+    /// row 0: cols (0,1); row 1: col (1). `ia = [0, 2, 3]`,
+    /// `ja = [0, 1, 1]`, `values = [1, 2, 1]`. Exercises factor →
+    /// refined solve via the C ABI surface.
+    #[test]
+    fn capi_factor_and_refined_solve() {
+        unsafe {
+            let s = feral_new();
+            assert!(!s.is_null());
+
+            let ia: [i32; 3] = [0, 2, 3];
+            let ja: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia.as_ptr(), ja.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp = feral_values_ptr(s);
+            assert!(!vp.is_null());
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+
+            assert_eq!(feral_factor(s, 1, 1), FERAL_SUCCESS);
+            assert_eq!(feral_num_neg(s), 1);
+
+            let mut rhs = [3.0_f64, 3.0];
+            // Default path (refined).
+            assert_eq!(feral_solve(s, 1, rhs.as_mut_ptr()), FERAL_SUCCESS);
+            assert!((rhs[0] - 1.0).abs() < 1e-12, "x0 = {}", rhs[0]);
+            assert!((rhs[1] - 1.0).abs() < 1e-12, "x1 = {}", rhs[1]);
+
+            feral_free(s);
+        }
+    }
+
+    /// X1 (dev/research/repo-review-2026-06-09.md): the documented contract is
+    /// "Returns -1 if no factor is available." `neg_evals` initialized to 0, so
+    /// a fresh handle reported 0 (a plausible "no negative eigenvalues") instead
+    /// of the -1 sentinel — an IPM host cannot distinguish "not factored yet"
+    /// from "definite matrix."
+    #[test]
+    fn num_neg_is_minus_one_before_any_factor() {
+        unsafe {
+            let s = feral_new();
+            assert!(!s.is_null());
+            assert_eq!(
+                feral_num_neg(s),
+                -1,
+                "a fresh solver has no factor; must report the -1 sentinel, not 0 (X1)"
+            );
+            feral_free(s);
+        }
+    }
+
+    /// X1: after a *failed* re-factor (`FERAL_FATAL`/`FERAL_SINGULAR`) the stale
+    /// negative-eigenvalue count from the previous successful factor must not
+    /// leak through `feral_num_neg`. An IPM host re-factors the same structure
+    /// with new values every iteration; a silent stale count is a
+    /// plausible-but-wrong inertia signal. Oracle: the first matrix
+    /// `[[1,2],[2,1]]` (eigenvalues 3, -1) has exactly one negative eigenvalue;
+    /// the re-factor injects a non-finite value (a NaN, as a diverging upstream
+    /// iterate would), which `factor()` rejects as `FERAL_FATAL` — so there is
+    /// no valid inertia and the contract value is the -1 sentinel. Pre-fix
+    /// `feral_num_neg` still returned the previous matrix's count (1).
+    #[test]
+    fn num_neg_invalidated_after_failed_refactor() {
+        unsafe {
+            let s = feral_new();
+            assert!(!s.is_null());
+            let ia: [i32; 3] = [0, 2, 3];
+            let ja: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia.as_ptr(), ja.as_ptr()),
+                FERAL_SUCCESS
+            );
+
+            // First factor: indefinite [[1,2],[2,1]] => one negative eigenvalue.
+            let vp = feral_values_ptr(s);
+            assert!(!vp.is_null());
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+            assert_eq!(feral_factor(s, 0, 0), FERAL_SUCCESS);
+            assert_eq!(feral_num_neg(s), 1);
+
+            // Re-factor the SAME structure with a non-finite value — no
+            // set_structure, exactly as an IPM host re-factors each iteration.
+            // factor() rejects the NaN as FERAL_FATAL.
+            let vp = feral_values_ptr(s);
+            std::ptr::copy_nonoverlapping([f64::NAN, 2.0, 1.0].as_ptr(), vp, 3);
+            let status = feral_factor(s, 0, 0);
+            assert_eq!(
+                status, FERAL_FATAL,
+                "a non-finite value must make the re-factor fail fatally"
+            );
+            assert_eq!(
+                feral_num_neg(s),
+                -1,
+                "a failed re-factor must invalidate the stale count, not report \
+                 the previous matrix's inertia (X1)"
+            );
+            feral_free(s);
+        }
+    }
+
+    /// Same matrix as above, but with `FERAL_REFINE=0` set. Verifies
+    /// the opt-out path still solves correctly.
+    #[test]
+    fn capi_solve_unrefined_opt_out() {
+        // Process-wide env var — fine because cargo serialises this
+        // test (single mod, single thread per env mutation) and we
+        // restore it before exit. If the test panics with REFINE off
+        // we leak the override; that only affects this test binary.
+        let prior = std::env::var("FERAL_REFINE").ok();
+        // SAFETY: single-threaded test sets a process-wide env var. No
+        // other thread observes the transition.
+        unsafe {
+            std::env::set_var("FERAL_REFINE", "0");
+
+            let s = feral_new();
+            let ia: [i32; 3] = [0, 2, 3];
+            let ja: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia.as_ptr(), ja.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp = feral_values_ptr(s);
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+            assert_eq!(feral_factor(s, 0, 0), FERAL_SUCCESS);
+
+            let mut rhs = [3.0_f64, 3.0];
+            assert_eq!(feral_solve(s, 1, rhs.as_mut_ptr()), FERAL_SUCCESS);
+            assert!((rhs[0] - 1.0).abs() < 1e-12);
+            assert!((rhs[1] - 1.0).abs() < 1e-12);
+
+            feral_free(s);
+
+            match prior {
+                Some(v) => std::env::set_var("FERAL_REFINE", v),
+                None => std::env::remove_var("FERAL_REFINE"),
+            }
+        }
+    }
+
+    /// `feral_min_pivot` / `feral_max_pivot` — the near-singularity
+    /// signal. Before any factor both return the `-1.0` sentinel. After
+    /// factoring the 2×2 indefinite `[[1,2],[2,1]]` (eigenvalues 3, -1)
+    /// under forced identity scaling, the D block is that 2×2 itself,
+    /// so `min|λ(D)| = 1` and `max|λ(D)| = 3`. Oracle is hand
+    /// calculation, external to the implementation.
+    #[test]
+    fn capi_min_max_pivot() {
+        let prior = std::env::var("FERAL_SCALING").ok();
+        // SAFETY: single-threaded test sets a process-wide env var,
+        // restored before exit. Identity scaling is benign for any
+        // other capi test that races this window.
+        unsafe {
+            std::env::set_var("FERAL_SCALING", "identity");
+
+            let s = feral_new();
+            assert!(!s.is_null());
+
+            // No factor yet → sentinel.
+            assert!(feral_min_pivot(s) < 0.0, "expected sentinel pre-factor");
+            assert!(feral_max_pivot(s) < 0.0, "expected sentinel pre-factor");
+
+            let ia: [i32; 3] = [0, 2, 3];
+            let ja: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia.as_ptr(), ja.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp = feral_values_ptr(s);
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+            assert_eq!(feral_factor(s, 0, 0), FERAL_SUCCESS);
+
+            let min_p = feral_min_pivot(s);
+            let max_p = feral_max_pivot(s);
+            assert!(
+                (min_p - 1.0).abs() < 1e-12,
+                "min|λ(D)|: expected 1.0, got {}",
+                min_p
+            );
+            assert!(
+                (max_p - 3.0).abs() < 1e-12,
+                "max|λ(D)|: expected 3.0, got {}",
+                max_p
+            );
+
+            feral_free(s);
+
+            // Null handle → sentinel.
+            assert!(feral_min_pivot(std::ptr::null()) < 0.0);
+            assert!(feral_max_pivot(std::ptr::null()) < 0.0);
+
+            match prior {
+                Some(v) => std::env::set_var("FERAL_SCALING", v),
+                None => std::env::remove_var("FERAL_SCALING"),
+            }
+        }
+    }
+
+    /// X9 (dev/research/repo-review-2026-06-09.md): `feral_set_structure`
+    /// must invalidate any stored numeric factor. The Ipopt embedding
+    /// protocol is set_structure → fill values → factor → solve; a host
+    /// that replaces the structure and then solves WITHOUT re-factoring
+    /// must not silently get the *previous* structure's factor. Before the
+    /// fix `feral_set_structure` left `Solver::last_factors` in place, so
+    /// the solve ran off the stale factor (refined against the new matrix)
+    /// and returned `FERAL_SUCCESS` — a plausible-but-wrong solution. The
+    /// correct behavior is a clean error: with no current factor the solve
+    /// fails (`FERAL_FATAL`).
+    ///
+    /// Oracle is the protocol contract, not the implementation: after a
+    /// structure change with no intervening `feral_factor`, there is no
+    /// valid factor for the new matrix, so a solve must not succeed. A1 is
+    /// the 2×2 indefinite `[[1,2],[2,1]]` (nnz=3); A2 is the 2×2 identity
+    /// (diagonal-only, nnz=2) — a genuinely different structure.
+    #[test]
+    fn set_structure_invalidates_stale_factor() {
+        unsafe {
+            let s = feral_new();
+            assert!(!s.is_null());
+
+            // A1 = [[1,2],[2,1]] — factor and solve to populate last_factors.
+            let ia1: [i32; 3] = [0, 2, 3];
+            let ja1: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia1.as_ptr(), ja1.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp = feral_values_ptr(s);
+            assert!(!vp.is_null());
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+            assert_eq!(feral_factor(s, 0, 0), FERAL_SUCCESS);
+            let mut rhs1 = [3.0_f64, 3.0];
+            assert_eq!(feral_solve(s, 1, rhs1.as_mut_ptr()), FERAL_SUCCESS);
+
+            // A2 = identity 2×2 — different structure (diagonal-only, nnz=2).
+            let ia2: [i32; 3] = [0, 1, 2];
+            let ja2: [i32; 2] = [0, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 2, ia2.as_ptr(), ja2.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp2 = feral_values_ptr(s);
+            assert!(!vp2.is_null());
+            std::ptr::copy_nonoverlapping([1.0_f64, 1.0].as_ptr(), vp2, 2);
+
+            // Solve WITHOUT a new factor. The stale A1 factor must not be
+            // used: the protocol requires a factor for the current structure.
+            let mut rhs2 = [3.0_f64, 3.0];
+            let status = feral_solve(s, 1, rhs2.as_mut_ptr());
+            assert_eq!(
+                status, FERAL_FATAL,
+                "solve after a structure change with no re-factor must fail \
+                 cleanly (X9), not reuse the previous structure's factor; got {}",
+                status
+            );
+
+            feral_free(s);
+        }
+    }
+
+    /// X7: `feral_factor` must not clone the whole matrix on every call.
+    /// In an IPM loop it is invoked once per iteration on an O(nnz)
+    /// matrix, so a per-call `CscMatrix::clone` is pure waste. The
+    /// factorization path borrows the matrix and clones only the small
+    /// CSC component vectors it needs internally — it never clones a
+    /// whole `CscMatrix`. So the correct invariant for `feral_factor`
+    /// is: zero `CscMatrix::clone` calls.
+    #[test]
+    fn capi_factor_does_not_clone_matrix() {
+        use crate::sparse::csc::{csc_matrix_clones, reset_csc_matrix_clones};
+        unsafe {
+            let s = feral_new();
+            assert!(!s.is_null());
+
+            // 2x2 indefinite `[[1,2],[2,1]]`, same as capi_factor tests.
+            let ia: [i32; 3] = [0, 2, 3];
+            let ja: [i32; 3] = [0, 1, 1];
+            assert_eq!(
+                feral_set_structure(s, 2, 3, ia.as_ptr(), ja.as_ptr()),
+                FERAL_SUCCESS
+            );
+            let vp = feral_values_ptr(s);
+            std::ptr::copy_nonoverlapping([1.0_f64, 2.0, 1.0].as_ptr(), vp, 3);
+
+            // Count clones across exactly the factor call.
+            reset_csc_matrix_clones();
+            assert_eq!(feral_factor(s, 0, 0), FERAL_SUCCESS);
+            let clones = csc_matrix_clones();
+
+            feral_free(s);
+
+            assert_eq!(
+                clones, 0,
+                "feral_factor cloned the whole CscMatrix {} time(s); \
+                 it must borrow s.matrix, not clone it (X7)",
+                clones
+            );
+        }
+    }
+}

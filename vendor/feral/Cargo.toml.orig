@@ -1,0 +1,157 @@
+[workspace]
+members = [".", "crates/feral-ordering-core", "crates/feral-amd", "crates/feral-amf", "crates/feral-metis", "crates/feral-scotch", "crates/feral-kahip", "crates/feral-diagnostics"]
+# Root commands (`cargo build`/`test`/`clippy` with no -p/--workspace) operate
+# on the `feral` package only. `feral-diagnostics` is a member so it shares the
+# lockfile and `cargo run -p feral-diagnostics --bin <name>` works, but it is
+# NOT a dependency of `feral`, so the default build/test set never compiles its
+# ~144 one-off binaries (issue #71). Build them explicitly with
+# `cargo build -p feral-diagnostics`.
+resolver = "2"
+
+[package]
+name = "feral"
+version = "0.18.0"
+edition = "2021"
+license = "MIT"
+description = "Sparse symmetric indefinite direct solver in pure Rust, with certified inertia counts."
+authors = ["John Kitchin <jkitchin@andrew.cmu.edu>"]
+repository = "https://github.com/jkitchin/feral"
+homepage = "https://github.com/jkitchin/feral"
+readme = "README.md"
+keywords = ["sparse", "solver", "linear-algebra", "ldlt", "kkt"]
+categories = ["mathematics", "science"]
+autobins = true
+autoexamples = false
+autotests = true
+exclude = [
+    "/dev",
+    "/external_benchmarks",
+    "/data",
+    "/manuscript",
+    "/ref",
+    "/scripts",
+    "/assets",
+    "/book",
+    "/examples",
+    "/src/bin",
+    "/tests",
+    "/.crucible",
+    "/.github",
+    "/.pre-commit-config.yaml",
+    "/CLAUDE.md",
+    "/FERAL-PROJECT-SPEC.md",
+    "/tasks.org",
+]
+
+[lib]
+name = "feral"
+# `staticlib` is added so the C ABI exposed by `src/capi.rs` can be
+# linked into the C++ Ipopt build via `feral-ipopt-shim`. The C ABI
+# is opt-in for downstream Ipopt builders; pure-Rust consumers
+# continue to use the `rlib`. See dev/decisions.md 2026-05-13.
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# Opt-in O(m) structural self-check after every sparse-LU Forrest–Tomlin update
+# (uperm bijection, diagonal-first rows, upper-triangular-in-uperm order, and the
+# u_above index matching U's off-diagonal pattern). Off by default: it is a
+# debugging aid that allocates per update, so it must not run in normal builds or
+# pollute the allocation-regression probe. Enable with
+# `cargo test --features lu-ft-invariant-check`.
+lu-ft-invariant-check = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIMD backbone for the Schur-update micro-kernel (Phase 2.4.2).
+# Pinned to faer 0.22.x's exact version. Usage is confined to
+# src/dense/schur_kernel.rs; see dev/decisions.md for the
+# replacement trigger and interface boundary.
+pulp = { version = "0.22.2", default-features = false, features = ["x86-v3"] }
+# Data-parallelism for the multifrontal assembly tree (Phase 2.5.2).
+# Pure-Rust, fits the zero-non-Rust-dep constraint. Used only by
+# the opt-in parallel driver in src/numeric/factorize.rs; the
+# sequential path remains the default and reference implementation.
+rayon = "1.10"
+# Ordering crates are consumed by `symbolic_factorize_with_method`
+# via the OrderingMethod enum in src/symbolic/mod.rs. The in-tree
+# src/ordering/amd.rs is still the default (OrderingMethod::Amd)
+# pending retirement per dev/decisions.md.
+feral-ordering-core = { path = "crates/feral-ordering-core", version = "0.2" }
+feral-amd = { path = "crates/feral-amd", version = "0.2" }
+feral-amf = { path = "crates/feral-amf", version = "0.2" }
+feral-metis = { path = "crates/feral-metis", version = "0.3" }
+feral-scotch = { path = "crates/feral-scotch", version = "0.3" }
+feral-kahip = { path = "crates/feral-kahip", version = "0.3" }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+# rmumps used only for reference timing comparisons in benchmarks:
+# rmumps = { path = "../ripopt/rmumps" }  # uncomment when needed
+
+[[bench]]
+name = "lu"
+harness = false
+
+[[bench]]
+name = "dense_factor"
+harness = false
+
+[[bench]]
+name = "schur_kernel"
+harness = false
+
+[[bench]]
+name = "issue52_overhead"
+harness = false
+
+[[bench]]
+name = "issue52_baseline"
+harness = false
+
+[[bench]]
+name = "lu_update_trace"
+harness = false
+
+[[example]]
+name = "ft_dense_bump"
+
+[[example]]
+name = "hyper_sparse_solve"
+
+[[example]]
+name = "real_basis_hyper"
+
+[[example]]
+name = "lu_fill_orderings"
+
+[[example]]
+name = "probe_illcond_ordering"
+
+[[example]]
+name = "bench_dense_front"
+
+[[example]]
+name = "bench_schur_micro"
+
+[[example]]
+name = "bench_packed_tiny"
+
+[[example]]
+name = "probe_kr_warmstart"
+
+[[example]]
+name = "bench_qap15"
+
+[[example]]
+name = "profile_qap15"
+
+[profile.release]
+debug = true
+
+[[example]]
+name = "cmp_ordering_accuracy"
+
+[[example]]
+name = "basis_refactor"

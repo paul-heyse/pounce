@@ -94,6 +94,23 @@ pub struct FeralSchurSolver {
     last_status: ESymSolverStatus,
 }
 
+/// Bound both FERAL factors, cached CSC matrices and their replacement builds,
+/// all partition maps, triplet splits, dense coupling/S/action buffers, RHS
+/// packing and simultaneous transient results. Old pattern buffers are included
+/// during reinitialization. The monolithic fallback is admitted independently.
+pub fn bounded_schur_storage(maximum:usize, nonzeros:usize)->Option<usize> {
+    let factors = crate::bounded_factor_storage(maximum, nonzeros)?.checked_mul(2)?;
+    // Nine split maps (three disjoint sets), two full maps, local maps,
+    // temporary S triplets and copied input triplets; 2x Vec growth retained.
+    let indices = nonzeros.checked_mul(24)?.checked_add(16*maximum*maximum+24*maximum+96)?;
+    // Values, FF values, old/new CSC values, dense AFS/W/ASTW/ASS and S,
+    // copied values, packed RHS, BF/BS/RS/RHSF/XS/XF: max n^2 or 7*n each.
+    let reals = nonzeros.checked_mul(20)?.checked_add(24*maximum*maximum+28*maximum+96)?;
+    factors.checked_add(indices.checked_mul(std::mem::size_of::<usize>())?)?
+        .checked_add(reals.checked_mul(std::mem::size_of::<Number>())?)?
+        .checked_add(std::mem::size_of::<FeralSchurSolver>()+2*maximum+512)
+}
+
 impl FeralSchurSolver {
     pub fn new(cfg: FeralConfig) -> Self {
         let ff_solver = configure_solver(&cfg);
@@ -146,9 +163,12 @@ impl FeralSchurSolver {
         ja: &[Index],
         schur_indices: &[usize],
     ) -> ESymSolverStatus {
-        let n_s = schur_indices.len();
-        let extent = (dim.max(0) as usize).saturating_add(ia.len()).saturating_add((dim.max(0) as usize).saturating_mul(n_s)).saturating_add(n_s.saturating_mul(n_s)).saturating_mul(128);
-        if pounce_common::observed::event(pounce_common::observed::Event::Storage { owner: "schur-factors-coupling-separator-refinement", known_bytes: extent, opaque: true }).is_err() { return self.fail(); }
+        let extent = self.cfg.bounded_dense_max_dimension.and_then(|maximum| {
+            if dim <= 0 || dim as usize > maximum || !(1..=7).contains(&maximum) {return None;}
+            bounded_schur_storage(maximum,ia.len())
+        });
+        if self.cfg.bounded_dense_max_dimension.is_some() && extent.is_none() {pounce_common::observed::reject(pounce_common::observed::Abort::Contract("Schur geometry exceeds bounded profile".into()));return self.fail();}
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear, owner:"schur-factors-coupling-separator-refinement", known_bytes:extent.unwrap_or(0), opaque:extent.is_none()}).is_err() {return self.fail();}
         let dim = dim as usize;
         if ia.len() != ja.len() {
             return self.fail();
@@ -280,7 +300,7 @@ impl FeralSchurSolver {
             use pounce_common::observed::{Operation, Path, Primitive};
             let Ok(operation) = Operation::begin(Path::SchurF, Primitive::Factor, 0, 0) else { return self.set_status(ESymSolverStatus::FatalError); };
             let status = self.ff_solver.factor(&ff_mat, None);
-            if !operation.finish(matches!(&status, FactorStatus::Success)) { return self.set_status(ESymSolverStatus::FatalError); }
+            if !operation.finish(matches!(&status, FactorStatus::Success) && self.ff_solver.inertia().is_none_or(|inertia|inertia.zero==0) && !self.pivot_below_floor(&self.ff_solver)) { return self.set_status(ESymSolverStatus::FatalError); }
             status
         } {
             FactorStatus::Success => match self.ff_solver.inertia() {
@@ -358,7 +378,7 @@ impl FeralSchurSolver {
             use pounce_common::observed::{Operation, Path, Primitive};
             let Ok(operation) = Operation::begin(Path::SchurS, Primitive::Factor, 0, 0) else { return self.set_status(ESymSolverStatus::FatalError); };
             let status = self.s_solver.factor(&s_mat, None);
-            if !operation.finish(matches!(&status, FactorStatus::Success)) { return self.set_status(ESymSolverStatus::FatalError); }
+            if !operation.finish(matches!(&status, FactorStatus::Success) && self.s_solver.inertia().is_none_or(|inertia|inertia.zero==0) && !self.pivot_below_floor(&self.s_solver)) { return self.set_status(ESymSolverStatus::FatalError); }
             status
         } {
             FactorStatus::Success => match self.s_solver.inertia() {

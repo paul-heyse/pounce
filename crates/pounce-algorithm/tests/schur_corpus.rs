@@ -28,6 +28,7 @@ use pounce_nlp::tnlp::{
 struct ConvexQp {
     n: usize,
     m: usize,
+    fixed_first: bool,
     width: usize,
     t: Vec<Number>,
     d: Vec<Number>,
@@ -66,6 +67,7 @@ impl ConvexQp {
             b[i] = s;
         }
         Self {
+            fixed_first: false,
             n,
             m,
             width,
@@ -93,6 +95,7 @@ impl TNLP for ConvexQp {
     fn get_bounds_info(&mut self, b: BoundsInfo<'_>) -> bool {
         b.x_l.iter_mut().for_each(|v| *v = -0.5);
         b.x_u.iter_mut().for_each(|v| *v = 0.5);
+        if self.fixed_first {b.x_l[0]=0.0;b.x_u[0]=0.0;}
         // Equalities.
         for i in 0..self.m {
             b.g_l[i] = self.b[i];
@@ -287,5 +290,44 @@ fn observed_application_binds_actual_layout_before_schur_and_terminal_abort_neve
         } else {
             assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::SchurS,primitive:Primitive::Factor,succeeded:true})));
         }
+    }
+}
+
+#[test]
+fn observed_bounded_application_admits_complete_linear_scope() {
+    use pounce_common::observed::{Scope,Event,StorageScope,Path,Primitive};
+    let observer=Rc::new(ActualObservation {layout:RefCell::new(None),events:RefCell::new(Vec::new()),refuse:false});
+    let scope=Scope::enter(observer.clone());
+    let mut app=IpoptApplication::new();
+    app.options_mut().set_string_value("linear_solver","feral",true,false).unwrap();
+    app.options_mut().set_string_value("mu_strategy_fallback","no",true,false).unwrap();
+    app.options_mut().set_integer_value("max_iter",50,true,false).unwrap();
+    app.set_effective_feral_config(pounce_feral::FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()});
+    app.initialize().unwrap();
+    let status=app.optimize_tnlp_without_presolve(Rc::new(RefCell::new(ConvexQp::new(4,1))));
+    assert!(ok(status),"{status:?}: {:?}",scope.abort());
+    let events=observer.events.borrow();
+    assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::SchurS,primitive:Primitive::Factor,succeeded:true})));
+    let linear:Vec<_>=events.iter().filter_map(|event|match event {Event::Storage {scope:StorageScope::Linear,known_bytes,opaque,..}=>Some((*known_bytes,*opaque)),_=>None}).collect();
+    assert!(!linear.is_empty());assert!(linear.iter().all(|(bytes,opaque)|*bytes>0 && !opaque));
+    assert!(events.iter().any(|event|matches!(event,Event::Storage {scope:StorageScope::Application,opaque:true,..})));
+}
+
+#[test]
+fn observed_layout_exposes_actual_fixed_removal_and_effective_relaxation() {
+    use pounce_common::observed::Scope;
+    for (rows,relaxed) in [(1,false),(4,true)] {
+        let observer=Rc::new(ActualObservation {layout:RefCell::new(None),events:RefCell::new(Vec::new()),refuse:true});
+        let _scope=Scope::enter(observer.clone());let mut app=IpoptApplication::new();
+        app.options_mut().set_string_value("linear_solver","feral",true,false).unwrap();
+        app.options_mut().set_string_value("fixed_variable_treatment","make_parameter",true,false).unwrap();
+        app.options_mut().set_integer_value("max_iter",2,true,false).unwrap();app.initialize().unwrap();
+        let mut qp=ConvexQp::new(4,rows);qp.fixed_first=true;
+        let _status=app.optimize_tnlp_without_presolve(Rc::new(RefCell::new(qp)));
+        let layout=observer.layout.borrow();let layout=layout.as_ref().unwrap();
+        assert_eq!(layout.relaxed_fixed,relaxed);assert_eq!(layout.x.len(),if relaxed {4}else {3});
+        assert_eq!(layout.row_index(0),Some(if relaxed {4}else {3}));
+        assert_eq!(layout.full_to_x[0],if relaxed {0}else {-1});
+        assert_eq!(layout.fixed_removed,if relaxed {vec![]}else {vec![0]});
     }
 }

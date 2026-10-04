@@ -175,6 +175,17 @@ impl StdAugSystemSolver {
             + (n_s as usize) // -I block
             + (n_d as usize); // dd diagonal (negative)
 
+        let dim = (n_x + n_s + n_c + n_d) as usize;
+        let maximum = pounce_common::observed::linear_maximum();
+        if maximum.is_some_and(|maximum| dim>maximum) {
+            pounce_common::observed::reject(pounce_common::observed::Abort::Contract("linear geometry exceeds bounded profile".into()));
+            return ESymSolverStatus::FatalError;
+        }
+        // Retained assembly triplet, old triplet during replacement, copied
+        // triplets for decide/diagnostics, W diagonal flattening, pack/dump RHS
+        // and TSym scaling vectors. 2x capacities and minimum-four allocations.
+        let extent = maximum.and_then(|_|total.checked_mul(8*std::mem::size_of::<Index>()+8*std::mem::size_of::<Number>())?.checked_add((dim*24+64)*std::mem::size_of::<Number>()));
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"assembled-wrapper-and-packed-actions",known_bytes:extent.unwrap_or(0),opaque:extent.is_none()}).is_err() {return ESymSolverStatus::FatalError;}
         self.irn = Vec::with_capacity(total);
         self.jcn = Vec::with_capacity(total);
         self.vals = vec![0.0; total];

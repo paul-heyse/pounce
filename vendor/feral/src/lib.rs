@@ -1,0 +1,63 @@
+// Deny `.unwrap()` and `.expect()` in production code, but allow them in
+// test modules (inside `#[cfg(test)]` blocks) where panics are acceptable.
+// This is a structural enforcement of the CLAUDE.md hard rule against
+// unwrap in `src/`, replacing the ad-hoc grep check in CI.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+// Style lints that fire only in test scaffolding — relaxed under cfg(test).
+// The lib build keeps default clippy strictness.
+#![cfg_attr(test, allow(clippy::needless_range_loop))]
+
+pub mod capi;
+pub mod dense;
+pub mod env;
+pub mod error;
+pub mod inertia;
+pub mod io;
+pub mod lu;
+pub mod numeric;
+pub mod ordering;
+pub mod scaling;
+pub mod sparse;
+pub mod symbolic;
+
+// Flat public API re-exported at crate root:
+pub use dense::factor::{
+    factor, factor_single_front, BunchKaufmanParams, Factors, ZeroPivotAction,
+};
+pub use dense::matrix::SymmetricMatrix;
+pub use dense::solve::{solve, solve_refined};
+pub use error::FeralError;
+pub use inertia::Inertia;
+pub use io::mtx::{parse_mtx, read_mtx, MtxMatrix};
+pub use io::sidecar::{read_sidecar, KktSidecar, SidecarInertia};
+// Unsymmetric LU basis engine (issue #81). LU operations are methods on the
+// factor structs, so the symmetric crate-root `factor`/`solve` names are
+// unaffected.
+pub use lu::dense_factor::DenseLu;
+pub use lu::dense_matrix::GeneralMatrix;
+pub use lu::sparse_factor::SparseLu;
+pub use lu::sparse_matrix::SparseColMatrix;
+pub use lu::sparse_symbolic::{LuOrderingParams, SparseLuSymbolic};
+pub use lu::{
+    should_use_dense_lu, LuParams, LuPivoting, LuScaling, LuSingularAction, RefactorCause,
+};
+pub use numeric::condition::{
+    estimate_condition_1norm, estimate_inverse_norm_1, hager_higham_inverse_norm_1, matrix_norm_1,
+    HagerHighamOperator,
+};
+pub use numeric::factorize::{
+    factorize_multifrontal_with_schur, LdltExport, NumericParams, ProfileReport, SchurBlock,
+};
+pub use numeric::solve::{
+    solve_sparse, solve_sparse_into, solve_sparse_refined, solve_sparse_refined_auto,
+    solve_sparse_refined_auto_into, solve_sparse_refined_auto_opts, solve_sparse_refined_cb,
+    solve_sparse_refined_cb_opts, solve_sparse_refined_into, solve_sparse_refined_opts,
+    solve_sparse_refined_with_diagnostics, solve_sparse_refined_with_diagnostics_opts,
+    RefineOptions, RefinementDiagnostics, RefinementStep, SolveCore, DEFAULT_REFINE_MAX_STEPS,
+};
+pub use numeric::solver::{
+    FactorStats, FactorStatus, OrderingInfo, QualityLevel, RaceArm, RaceResult, Solver,
+};
+pub use sparse::csc::{CscMatrix, CscPattern};
+pub use symbolic::{SymbolicProfileReport, WorkEstimate};
