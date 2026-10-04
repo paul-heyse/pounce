@@ -44,9 +44,11 @@ pub struct SchurAugSystemSolver {
     max_schur_frac: f64,
 
     /// `None` until the partition has been validated against a concrete KKT
-    /// dimension; `Some(dim)` records what it was pinned for (re-decide only if
-    /// the dimension changes, which it does not within one solve).
+    /// dimension. Active Schur structures are rebuilt when the inner assembly
+    /// changes, including curvature sparsity changes at the same dimension.
     decided_for_dim: Option<Index>,
+    /// Match the inner assembly's structural identity, not merely its dimension.
+    decided_for_structure: Option<(usize, usize, usize, Index, Index, Index)>,
     /// After [`Self::decided_for_dim`] is set: whether the Schur path is active.
     /// `false` means permanent fallback to `inner`.
     use_schur: bool,
@@ -67,6 +69,7 @@ impl SchurAugSystemSolver {
             schur_indices,
             max_schur_frac: DEFAULT_MAX_SCHUR_FRAC,
             decided_for_dim: None,
+            decided_for_structure: None,
             use_schur: false,
             have_factor: false,
             negevals: 0,
@@ -75,14 +78,20 @@ impl SchurAugSystemSolver {
         }
     }
 
-    /// Decide (once per KKT dimension) whether the Schur path is usable and, if
-    /// so, pin its structure. `irn/jcn` are the assembled lower-triangle
+    /// Decide whether the Schur path is usable and, if so, pin its current
+    /// structure. A numerical fallback stays permanent at this dimension.
+    /// `irn/jcn` are the assembled lower-triangle
     /// triplet from `inner`.
     fn decide(&mut self, dim: Index) {
-        if self.decided_for_dim == Some(dim) {
+        let structure = self.inner.assembled_structure();
+        if self.decided_for_dim == Some(dim)
+            && (self.decided_for_structure == structure || !self.use_schur)
+        {
             return;
         }
         self.decided_for_dim = Some(dim);
+        self.decided_for_structure = structure;
+        self.have_factor = false;
         self.use_schur = false;
         let n_s = self.schur_indices.len();
         let d = dim as usize;
@@ -334,6 +343,32 @@ mod observed_tests {
             if self.deny_fallback && matches!(event,Event::Begin {path:Path::Monolithic,primitive:Primitive::Factor,..}) {return Err(pounce_common::observed::Abort::Resource("fallback work refusal".into()));}
             Ok(())
         }
+    }
+    #[test]
+    fn observed_bounded_schur_rebinds_changed_curvature_structure_at_same_dimension() {
+        let observer=Rc::new(Observe {events:std::cell::RefCell::new(Vec::new()),deny_fallback:false});
+        let scope=Scope::enter(observer.clone());
+        pounce_common::observed::set_linear_maximum(Some(7));
+        let cfg=FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
+        let inner=StdAugSystemSolver::new(pounce_linsol::TSymLinearSolver::new(Box::new(pounce_feral::FeralSolverInterface::with_config(cfg.clone())),None,false));
+        let mut solver=SchurAugSystemSolver::new(inner,vec![2],cfg);
+        let mut diagonal=SymTMatrix::new(SymTMatrixSpace::new(2,vec![1,2],vec![1,2]));diagonal.set_values(&[2.0,1.0]);
+        let mut dense=SymTMatrix::new(SymTMatrixSpace::new(2,vec![1,2,2],vec![1,1,2]));dense.set_values(&[2.0,0.25,1.0]);
+        let mut jc=GenTMatrix::new(GenTMatrixSpace::new(1,2,vec![1,1],vec![1,2]));jc.set_values(&[1.0,1.0]);
+        let jd=GenTMatrix::new(GenTMatrixSpace::new(0,2,vec![],vec![]));
+        let xs=DenseVectorSpace::new(2);let cs=DenseVectorSpace::new(1);let zs=DenseVectorSpace::new(0);
+        let mut rx=xs.make_new_dense();rx.set_values(&[1.0,2.0]);let mut rc=cs.make_new_dense();rc.set_values(&[1.0]);let rz=zs.make_new_dense();
+        let mut sx=xs.make_new_dense();let mut sc=cs.make_new_dense();let mut ss=zs.make_new_dense();let mut sd=zs.make_new_dense();
+        let rhs=AugSysRhs {rhs_x:&rx,rhs_s:&rz,rhs_c:&rc,rhs_d:&rz};
+        for w in [&diagonal,&dense,&diagonal] {
+            let coeffs=AugSysCoeffs {w:Some(w),w_factor:1.0,d_x:None,delta_x:0.0,d_s:None,delta_s:0.0,j_c:&jc,d_c:None,delta_c:0.0,j_d:&jd,d_d:None,delta_d:0.0};
+            let mut sol=AugSysSol {sol_x:&mut sx,sol_s:&mut ss,sol_c:&mut sc,sol_d:&mut sd};
+            assert_eq!(solver.solve(&coeffs,&rhs,&mut sol,false,0),ESymSolverStatus::Success);
+            assert!(solver.use_schur);
+            assert!((sx.values().iter().sum::<f64>()-1.0).abs()<1e-12);
+        }
+        assert!(scope.abort().is_none());
+        assert_eq!(observer.events.borrow().iter().filter(|event|matches!(event,Event::End {path:Path::SchurF,primitive:Primitive::Factor,succeeded:true})).count(),3);
     }
     #[test]
     fn observed_bounded_failed_ff_keeps_schur_storage_while_admitting_fallback() {

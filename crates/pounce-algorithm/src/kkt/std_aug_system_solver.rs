@@ -410,6 +410,11 @@ impl StdAugSystemSolver {
     pub(crate) fn assembled_dim(&self) -> Index {
         self.dim
     }
+    /// Current assembly fingerprint, including curvature sparsity changes at
+    /// an unchanged dimension (for example a finite-difference Hessian).
+    pub(crate) fn assembled_structure(&self) -> Option<(usize, usize, usize, Index, Index, Index)> {
+        self.struct_sig
+    }
     /// Assembled 1-based lower-triangle triplet + value array (after
     /// [`Self::assemble`]). Same layout the linear solver receives.
     pub(crate) fn assembled_triplet(&self) -> (&[Index], &[Index], &[Number]) {
