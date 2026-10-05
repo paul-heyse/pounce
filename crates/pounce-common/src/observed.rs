@@ -119,7 +119,7 @@ pub fn reserve_wrapper(owner:&'static str,instance:usize,n:usize,rank:usize,trip
         .checked_add(n.checked_mul(rank)?.checked_mul(128)?)?
         .checked_add(rank.checked_mul(rank)?.checked_mul(64)?)?
         .checked_add(triplets.checked_mul(128)?)?.checked_add(n.checked_mul(256)?)?.checked_add(1024)?;
-        scalars.checked_mul(2*std::mem::size_of::<usize>())}) ();
+        scalars.checked_mul(2*std::mem::size_of::<f64>().max(std::mem::size_of::<usize>()))}) ();
     let bounded=linear_bounded();
     if bounded && extent.is_none(){reject(Abort::Resource("linear wrapper storage extent overflow".into()));return false;}
     event(Event::Storage {scope:StorageScope::Linear,owner,instance,known_bytes:extent.unwrap_or(0),opaque:!bounded}).is_ok()
