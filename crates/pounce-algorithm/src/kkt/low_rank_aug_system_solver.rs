@@ -38,6 +38,8 @@ use pounce_linsol::ESymSolverStatus;
 use std::rc::Rc;
 
 pub struct LowRankAugSystemSolver {
+    storage_n:usize,
+    storage_rank:usize,
     /// Inner solver that owns the diagonal factorization.
     inner: Box<dyn AugSystemSolver>,
     /// Whether `solve` has been called yet.
@@ -140,8 +142,19 @@ struct Factorization {
 }
 
 impl LowRankAugSystemSolver {
+    fn admit_storage(&mut self,coeffs:&AugSysCoeffs<'_>,rhs:&AugSysRhs<'_>)->bool {
+        let dims=[rhs.rhs_x.dim(),rhs.rhs_s.dim(),rhs.rhs_c.dim(),rhs.rhs_d.dim()];
+        if dims.iter().any(|dim|*dim<0){pounce_common::observed::reject(pounce_common::observed::Abort::Contract("negative low-rank layout".into()));return false;}
+        let Some(n)=dims.iter().try_fold(0usize,|n,dim|n.checked_add(*dim as usize)) else {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("low-rank dimension overflow".into()));return false;};
+        let rank=coeffs.w.and_then(|w|w.as_any().downcast_ref::<LowRankUpdateSymMatrix>()).map_or(0,|w|w.get_u().map_or(0,|v|v.n_cols().max(0) as usize).saturating_add(w.get_v().map_or(0,|v|v.n_cols().max(0) as usize)));
+        self.storage_n=self.storage_n.max(n);self.storage_rank=self.storage_rank.max(rank);
+        pounce_common::observed::reserve_wrapper("woodbury-factors-and-actions",self as *const Self as usize,self.storage_n,self.storage_rank,0)
+    }
+
     pub fn new(inner: Box<dyn AugSystemSolver>) -> Self {
         Self {
+            storage_n:0,
+            storage_rank:0,
             inner,
             first_call: true,
             num_neg_evals: 0,
@@ -990,6 +1003,7 @@ impl AugSystemSolver for LowRankAugSystemSolver {
         check_neg_evals: bool,
         num_neg_evals: Index,
     ) -> ESymSolverStatus {
+        if !self.admit_storage(coeffs,rhs){return ESymSolverStatus::FatalError;}
         // Skip inertia checks when the inner solver doesn't provide
         // them — mirrors `IpLowRankAugSystemSolver.cpp:102-105`.
         let mut check_neg_evals = check_neg_evals;
@@ -1118,6 +1132,7 @@ impl AugSystemSolver for LowRankAugSystemSolver {
         rhs: &AugSysRhs<'_>,
         sol: &mut AugSysSol<'_>,
     ) -> ESymSolverStatus {
+        if !self.admit_storage(coeffs,rhs){return ESymSolverStatus::FatalError;}
         // The fast path is only valid for a low-rank W whose SMW
         // factorization we hold and whose coefficients have not moved
         // since we built it. `first_call` additionally guarantees

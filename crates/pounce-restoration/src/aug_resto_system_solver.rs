@@ -66,6 +66,9 @@ use std::rc::Rc;
 
 /// Resto-side wrapper around an inner [`AugSystemSolver`].
 pub struct AugRestoSystemSolver {
+    storage_n:usize,
+    storage_rank:usize,
+    storage_triplets:usize,
     inner: Box<dyn AugSystemSolver>,
 
     /// Pinned on the first solve so the inner solver's structure cache
@@ -111,6 +114,9 @@ impl std::fmt::Debug for AugRestoSystemSolver {
 impl AugRestoSystemSolver {
     pub fn new(inner: Box<dyn AugSystemSolver>) -> Self {
         Self {
+            storage_n:0,
+            storage_rank:0,
+            storage_triplets:0,
             inner,
             w_lowrank_orig: None,
             initialized: false,
@@ -233,6 +239,15 @@ impl AugSystemSolver for AugRestoSystemSolver {
             .as_any()
             .downcast_ref::<GenTMatrix>()
             .expect("AugRestoSystemSolver: J_d must be a GenTMatrix");
+
+        // Admit projected curvature/Jacobian, rank columns and simultaneous
+        // reduction/action scratch before any dense materialization or cloning.
+        let dims=[rhs.rhs_x.dim(),rhs.rhs_s.dim(),rhs.rhs_c.dim(),rhs.rhs_d.dim()];
+        let Some(n)=dims.iter().try_fold(0usize,|n,dim|usize::try_from(*dim).ok().and_then(|dim|n.checked_add(dim))) else {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("restoration layout overflow".into()));return ESymSolverStatus::FatalError;};
+        let rank=w_dyn.as_any().downcast_ref::<LowRankUpdateSymMatrix>().map_or(0,|w|w.get_u().map_or(0,|v|v.n_cols().max(0) as usize).saturating_add(w.get_v().map_or(0,|v|v.n_cols().max(0) as usize)));
+        let Some(triplets)=j_c.values().len().checked_add(j_d.values().len()).and_then(|v|v.checked_add(w_dyn.as_any().downcast_ref::<SymTMatrix>().map_or(0,|w|w.values().len()))) else {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("restoration triplet overflow".into()));return ESymSolverStatus::FatalError;};
+        self.storage_n=self.storage_n.max(n);self.storage_rank=self.storage_rank.max(rank);self.storage_triplets=self.storage_triplets.max(triplets);
+        if !pounce_common::observed::reserve_wrapper("restoration-projection-and-actions",self as *const Self as usize,self.storage_n,self.storage_rank,self.storage_triplets){return ESymSolverStatus::FatalError;}
 
         // The flat Schur reduction reads `W`'s triplets directly. The
         // exact-Hessian path publishes `W` as a [`SymTMatrix`] (orig
@@ -856,8 +871,6 @@ mod tests {
     /// step never explored. So compare the operators directly.
     #[test]
     fn factored_and_densified_orig_blocks_are_the_same_operator() {
-        use pounce_linalg::SymMatrix;
-
         let n: Index = 7;
         let nu = n as usize;
         let space = LowRankUpdateSymMatrixSpace::new(n, None, false);

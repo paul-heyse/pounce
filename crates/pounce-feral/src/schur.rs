@@ -49,6 +49,8 @@ pub struct FeralSchurSolver {
     cfg: FeralConfig,
 
     dim: usize,
+    storage_dimension: usize,
+    storage_nonzeros: usize,
     n_f: usize,
     n_s: usize,
 
@@ -102,13 +104,14 @@ pub fn bounded_schur_storage(maximum:usize, nonzeros:usize)->Option<usize> {
     let factors = crate::bounded_factor_storage(maximum, nonzeros)?.checked_mul(2)?;
     // Nine split maps (three disjoint sets), two full maps, local maps,
     // temporary S triplets and copied input triplets; 2x Vec growth retained.
-    let indices = nonzeros.checked_mul(24)?.checked_add(16*maximum*maximum+24*maximum+96)?;
+    let square=maximum.checked_mul(maximum)?;
+    let indices = nonzeros.checked_mul(24)?.checked_add(square.checked_mul(16)?.checked_add(maximum.checked_mul(24)?)?.checked_add(96)?)?;
     // Values, FF values, old/new CSC values, dense AFS/W/ASTW/ASS and S,
     // copied values, packed RHS, BF/BS/RS/RHSF/XS/XF: max n^2 or 7*n each.
-    let reals = nonzeros.checked_mul(20)?.checked_add(24*maximum*maximum+28*maximum+96)?;
+    let reals = nonzeros.checked_mul(20)?.checked_add(square.checked_mul(24)?.checked_add(maximum.checked_mul(28)?)?.checked_add(96)?)?;
     factors.checked_add(indices.checked_mul(std::mem::size_of::<usize>())?)?
         .checked_add(reals.checked_mul(std::mem::size_of::<Number>())?)?
-        .checked_add(std::mem::size_of::<FeralSchurSolver>()+2*maximum+512)
+        .checked_add(maximum.checked_mul(2)?.checked_add(std::mem::size_of::<FeralSchurSolver>()+512)?)
 }
 
 impl FeralSchurSolver {
@@ -118,6 +121,8 @@ impl FeralSchurSolver {
         Self {
             cfg,
             dim: 0,
+            storage_dimension:0,
+            storage_nonzeros:0,
             n_f: 0,
             n_s: 0,
             f_kkt: Vec::new(),
@@ -163,12 +168,13 @@ impl FeralSchurSolver {
         ja: &[Index],
         schur_indices: &[usize],
     ) -> ESymSolverStatus {
-        let extent = self.cfg.bounded_dense_max_dimension.and_then(|maximum| {
-            if dim <= 0 || dim as usize > maximum || !(1..=7).contains(&maximum) {return None;}
-            bounded_schur_storage(maximum,ia.len())
-        });
-        if self.cfg.bounded_dense_max_dimension.is_some() && extent.is_none() {pounce_common::observed::reject(pounce_common::observed::Abort::Contract("Schur geometry exceeds bounded profile".into()));return self.fail();}
-        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear, owner:"schur-factors-coupling-separator-refinement", known_bytes:extent.unwrap_or(0), opaque:extent.is_none()}).is_err() {return self.fail();}
+        if dim <= 0 || self.cfg.bounded_storage_max_dimension.is_some_and(|maximum|dim as usize>maximum) {
+            pounce_common::observed::reject(pounce_common::observed::Abort::Contract("Schur geometry exceeds admitted profile".into()));return self.fail();
+        }
+        let complete=crate::complete_storage_profile(&self.cfg);
+        let extent=if complete {bounded_schur_storage((dim as usize).max(self.storage_dimension),ia.len().max(self.storage_nonzeros))} else {None};
+        if complete && extent.is_none() {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("Schur storage extent overflow".into()));return self.fail();}
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear, owner:"schur-factors-coupling-separator-refinement", instance:self as *const Self as usize, known_bytes:extent.unwrap_or(0), opaque:extent.is_none()}).is_err() {return self.fail();}
         let dim = dim as usize;
         if ia.len() != ja.len() {
             return self.fail();
@@ -243,6 +249,8 @@ impl FeralSchurSolver {
             }
         }
 
+        self.storage_dimension=self.storage_dimension.max(dim);
+        self.storage_nonzeros=self.storage_nonzeros.max(ia.len());
         self.dim = dim;
         self.n_f = n_f;
         self.n_s = n_s;
@@ -419,8 +427,9 @@ impl FeralSchurSolver {
     /// column-major (`dim` per column, in KKT/original index order). Requires a
     /// prior successful [`Self::factor`].
     pub fn backsolve(&self, nrhs: Index, rhs: &mut [Number]) -> ESymSolverStatus {
+        if nrhs<0 {return ESymSolverStatus::FatalError;}
         let nrhs = nrhs as usize;
-        if !self.have_factor || rhs.len() != self.dim * nrhs {
+        if !self.have_factor || self.dim.checked_mul(nrhs)!=Some(rhs.len()) {
             return ESymSolverStatus::FatalError;
         }
         let (n_f, n_s) = (self.n_f, self.n_s);

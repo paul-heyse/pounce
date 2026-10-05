@@ -302,9 +302,9 @@ fn observed_bounded_application_admits_complete_linear_scope() {
     app.options_mut().set_string_value("linear_solver","feral",true,false).unwrap();
     app.options_mut().set_string_value("mu_strategy_fallback","no",true,false).unwrap();
     app.options_mut().set_integer_value("max_iter",50,true,false).unwrap();
-    app.set_effective_feral_config(pounce_feral::FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()});
+    app.set_effective_feral_config(pounce_feral::FeralConfig {bounded_storage_max_dimension:None,ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::Mc64Symmetric,increase_quality:false,..Default::default()});
     app.initialize().unwrap();
-    let status=app.optimize_tnlp_without_presolve(Rc::new(RefCell::new(ConvexQp::new(4,1))));
+    let status=app.optimize_tnlp_without_presolve(Rc::new(RefCell::new(ConvexQp::new(12,1))));
     assert!(ok(status),"{status:?}: {:?}",scope.abort());
     let events=observer.events.borrow();
     assert!(events.iter().any(|event|matches!(event,Event::End {path:Path::SchurS,primitive:Primitive::Factor,succeeded:true})));

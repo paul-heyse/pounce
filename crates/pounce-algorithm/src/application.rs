@@ -2404,7 +2404,7 @@ impl IpoptApplication {
         // one arm and relaxed on the other. That is a different problem, not a
         // different trajectory on one.
         let (lo_inf, up_inf, fixed_treatment) = self.adapter_options();
-        if pounce_common::observed::event(pounce_common::observed::Event::Storage { scope: pounce_common::observed::StorageScope::Application, owner: "pounce-classification-algorithm-factors", known_bytes: 0, opaque: true }).is_err() { self.timing.borrow().overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage { scope: pounce_common::observed::StorageScope::Application, owner: "pounce-classification-algorithm-factors", instance:self as *const Self as usize, known_bytes: 0, opaque: true }).is_err() { self.timing.borrow().overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
         let adapter = match TNLPAdapter::new_with_options(
             Rc::clone(&tnlp),
             lo_inf,
@@ -4369,7 +4369,7 @@ impl IpoptApplication {
         // `make_parameter` would leave `n_x_var < n_c` — mirrors upstream
         // `IpTNLPAdapter.cpp:623-633`).
         let (lo_inf, up_inf, fixed_treatment) = self.adapter_options();
-        if pounce_common::observed::event(pounce_common::observed::Event::Storage { scope: pounce_common::observed::StorageScope::Application, owner: "pounce-classification-algorithm-factors", known_bytes: 0, opaque: true }).is_err() { timing.overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage { scope: pounce_common::observed::StorageScope::Application, owner: "pounce-classification-algorithm-factors", instance:self as *const Self as usize, known_bytes: 0, opaque: true }).is_err() { timing.overall_alg.end(); return ApplicationReturnStatus::UserRequestedStop; }
         let adapter = match TNLPAdapter::new_with_options(
             Rc::clone(&tnlp),
             lo_inf,
@@ -4612,21 +4612,20 @@ impl IpoptApplication {
         // per-problem `.opt` files can flip backend knobs without
         // rebuilding pounce.
         let mut feral_cfg = self.effective_feral_config.clone().unwrap_or_else(|| feral_config_from_options(&self.options));
-        pounce_common::observed::set_linear_maximum(feral_cfg.bounded_dense_max_dimension);
-        if let Some(maximum) = feral_cfg.bounded_dense_max_dimension {
-            let valid = (1..=7).contains(&maximum)
-                && matches!(feral_cfg.ordering, pounce_feral::OrderingMethod::Amd)
-                && feral_cfg.parallel == Some(false)
-                && matches!(feral_cfg.scaling, pounce_feral::ScalingStrategy::Auto | pounce_feral::ScalingStrategy::InfNorm | pounce_feral::ScalingStrategy::Identity);
-            if !valid { pounce_common::observed::reject(pounce_common::observed::Abort::Contract("unsupported bounded linear profile".into()));return ApplicationReturnStatus::UserRequestedStop; }
-            // Only object headers are born while building the algorithm. The
-            // actual dimension/pattern buffers are admitted at build_structure.
-            // Main+restoration each retain at most a monolithic interface and a
-            // Schur pair. Include fallback wrappers while the Schur pair lives.
-            let headers = 6*(std::mem::size_of::<pounce_feral::FeralSolverInterface>()+pounce_feral::bounded_factor_storage(maximum,0).unwrap_or(0)+512)
-                + 2*(std::mem::size_of::<crate::kkt::StdAugSystemSolver>()+std::mem::size_of::<crate::kkt::SchurAugSystemSolver>()+std::mem::size_of::<pounce_linsol::TSymLinearSolver>()+512);
-            if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"linear-bundle-headers",known_bytes:headers,opaque:false}).is_err() {return ApplicationReturnStatus::UserRequestedStop;}
+        pounce_common::observed::set_linear_maximum(feral_cfg.bounded_storage_max_dimension);
+        let complete_linear=pounce_feral::complete_storage_profile(&feral_cfg)
+            && self.external_ordering.is_none();
+        pounce_common::observed::set_linear_bounded(complete_linear);
+        if let Some(maximum)=feral_cfg.bounded_storage_max_dimension {
+            if maximum==0 || !complete_linear {pounce_common::observed::reject(pounce_common::observed::Abort::Contract("unsupported admitted linear profile".into()));return ApplicationReturnStatus::UserRequestedStop;}
         }
+        // Algorithm construction only allocates headers. Actual pattern/geometry,
+        // sparse factors, MC64 and actions are admitted by their source owners.
+        let base_headers=6*(std::mem::size_of::<pounce_feral::FeralSolverInterface>()+512)
+            +2*(std::mem::size_of::<crate::kkt::StdAugSystemSolver>()+std::mem::size_of::<crate::kkt::SchurAugSystemSolver>()+std::mem::size_of::<pounce_linsol::TSymLinearSolver>()+512);
+        let separator_count=self.kkt_schur_block.as_ref().map_or(0,Vec::len);
+        let Some(headers)=separator_count.checked_mul(32*std::mem::size_of::<usize>()).and_then(|bytes|bytes.checked_add(base_headers)) else {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("linear bundle storage overflow".into()));return ApplicationReturnStatus::UserRequestedStop;};
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"linear-bundle-headers", instance:self as *const Self as usize, known_bytes:headers,opaque:!complete_linear}).is_err() {return ApplicationReturnStatus::UserRequestedStop;}
         // Block-triangular / Schur KKT partition (pounce#180 item 2). Configure
         // the Schur block solvers from the *base* feral cfg: a full-KKT external
         // ordering (item 1) is sized for the whole system and cannot apply to

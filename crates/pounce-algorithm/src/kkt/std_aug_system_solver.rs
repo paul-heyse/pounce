@@ -184,8 +184,11 @@ impl StdAugSystemSolver {
         // Retained assembly triplet, old triplet during replacement, copied
         // triplets for decide/diagnostics, W diagonal flattening, pack/dump RHS
         // and TSym scaling vectors. 2x capacities and minimum-four allocations.
-        let extent = maximum.and_then(|_|total.checked_mul(8*std::mem::size_of::<Index>()+8*std::mem::size_of::<Number>())?.checked_add((dim*24+64)*std::mem::size_of::<Number>()));
-        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"assembled-wrapper-and-packed-actions",known_bytes:extent.unwrap_or(0),opaque:extent.is_none()}).is_err() {return ESymSolverStatus::FatalError;}
+        let held_total=total.max(self.irn.capacity()).max(self.jcn.capacity()).max(self.vals.capacity());
+        let held_dim=dim.max(self.dim.max(0) as usize);
+        let extent = pounce_common::observed::linear_bounded().then_some(()).and_then(|_|held_total.checked_mul(8*std::mem::size_of::<Index>()+8*std::mem::size_of::<Number>())?.checked_add(held_dim.checked_mul(24)?.checked_add(64)?.checked_mul(std::mem::size_of::<Number>())?));
+        if pounce_common::observed::linear_bounded() && extent.is_none() {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("assembled storage extent overflow".into()));return ESymSolverStatus::FatalError;}
+        if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"assembled-wrapper-and-packed-actions", instance:self as *const Self as usize, known_bytes:extent.unwrap_or(0),opaque:extent.is_none()}).is_err() {return ESymSolverStatus::FatalError;}
         self.irn = Vec::with_capacity(total);
         self.jcn = Vec::with_capacity(total);
         self.vals = vec![0.0; total];

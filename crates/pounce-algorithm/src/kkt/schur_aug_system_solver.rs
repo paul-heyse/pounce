@@ -349,7 +349,8 @@ mod observed_tests {
         let observer=Rc::new(Observe {events:std::cell::RefCell::new(Vec::new()),deny_fallback:false});
         let scope=Scope::enter(observer.clone());
         pounce_common::observed::set_linear_maximum(Some(7));
-        let cfg=FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
+        pounce_common::observed::set_linear_bounded(true);
+        let cfg=FeralConfig {bounded_storage_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
         let inner=StdAugSystemSolver::new(pounce_linsol::TSymLinearSolver::new(Box::new(pounce_feral::FeralSolverInterface::with_config(cfg.clone())),None,false));
         let mut solver=SchurAugSystemSolver::new(inner,vec![2],cfg);
         let mut diagonal=SymTMatrix::new(SymTMatrixSpace::new(2,vec![1,2],vec![1,2]));diagonal.set_values(&[2.0,1.0]);
@@ -375,7 +376,8 @@ mod observed_tests {
         for deny_fallback in [false,true] {
             let observer=Rc::new(Observe {events:std::cell::RefCell::new(Vec::new()),deny_fallback});let scope=Scope::enter(observer.clone());
             pounce_common::observed::set_linear_maximum(Some(7));
-            let cfg=FeralConfig {bounded_dense_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
+        pounce_common::observed::set_linear_bounded(true);
+            let cfg=FeralConfig {bounded_storage_max_dimension:Some(7),ordering:pounce_feral::OrderingMethod::Amd,parallel:Some(false),scaling:pounce_feral::ScalingStrategy::InfNorm,..Default::default()};
             let inner=StdAugSystemSolver::new(pounce_linsol::TSymLinearSolver::new(Box::new(pounce_feral::FeralSolverInterface::with_config(cfg.clone())),None,false));
             let mut solver=SchurAugSystemSolver::new(inner,vec![2],cfg);
             let mut w=SymTMatrix::new(SymTMatrixSpace::new(2,vec![1,2],vec![1,2]));w.set_values(&[0.0,2.0]);

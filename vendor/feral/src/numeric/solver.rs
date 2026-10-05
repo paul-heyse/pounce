@@ -341,7 +341,7 @@ pub struct Solver {
     quality_level: QualityLevel,
     last_symbolic: Option<SymbolicFactorization>,
     last_factors: Option<SparseFactors>,
-    bounded_dense_max_dimension: Option<usize>,
+    bounded_storage_max_dimension: Option<usize>,
     last_inertia: Option<Inertia>,
     last_pattern_fingerprint: Option<PatternFingerprint>,
     /// The exact `(col_ptr, row_idx)` of the pattern the cached symbolic was
@@ -587,7 +587,7 @@ impl Solver {
             quality_level: QualityLevel::Baseline,
             last_symbolic: None,
             last_factors: None,
-            bounded_dense_max_dimension: None,
+            bounded_storage_max_dimension: None,
             last_inertia: None,
             last_pattern_fingerprint: None,
             last_pattern: None,
@@ -1295,11 +1295,10 @@ impl Solver {
         }
     }
 
-    /// Select the storage-bounded serial tiny profile. Dimensions 1..=7 use
-    /// the existing scalar dense fast-path; no symbolic analysis, ordering race,
-    /// parallel workspace, MC64 or diagnostic refinement is allocated.
-    pub fn with_bounded_dense_max_dimension(mut self, maximum: usize) -> Self {
-        // A new profile cannot inherit a larger unbounded workspace or caches.
+    /// Select an admitted geometry for the regular serial AMD native route.
+    /// This retains the normal sparse/dense dispatch, scaling and quality algorithms.
+    pub fn with_bounded_storage_max_dimension(mut self, maximum: usize) -> Self {
+        // A new reservation cannot inherit a larger unbounded workspace or caches.
         self.workspace = FactorWorkspace::new();
         self.last_symbolic = None;
         self.last_pattern = None;
@@ -1311,65 +1310,37 @@ impl Solver {
         self.parallel_pool = None;
         self.last_profiler = None;
         self.last_symbolic_profiler = None;
-        self.bounded_dense_max_dimension = Some(maximum);
+        self.bounded_storage_max_dimension = Some(maximum);
         self
     }
 
-    /// Complete conservative requested-allocation extent for this profile,
-    /// including old retained factors during replacement and refinement for up
-    /// to seven RHS. This is a reservation bound, not an observed heap count.
-    pub fn bounded_dense_storage_bytes(maximum: usize) -> Option<usize> {
-        if !(1..=7).contains(&maximum) { return None; }
+    /// Complete conservative numerical-owner extent for serial AMD, including MC64,
+    /// regular sparse factors, transient/retained symbolic and numeric replacements,
+    /// dense fast paths, delayed fronts, solve/refinement and old warm workspace.
+    /// See `docs/storage-reservation.md` for the source-owner derivation.
+    pub fn conservative_storage_bytes(maximum: usize, nrhs: usize) -> Option<usize> {
+        if maximum == 0 { return None; }
         let n = maximum;
-        // Dense/scalar owners: pooled dense values, old L, new L, forced-scalar
-        // working copy, and two contribution buffers. All <= n*n. 2x growth
-        // and Vec's four-element minimum are covered even on warm resizing.
-        let matrices = 6 * (2 * (n*n).max(4)) * std::mem::size_of::<f64>();
-        // Scaling(2), scalar scratch(2), old/new D/subdiag(4), norm(1),
-        // solve workspaces + refinement(10*n_rhs), RHS/results(4*n_rhs):
-        // 9*n + 14*n*7. Separate usize maps/permutations + active RHS lists
-        // consume at most 12*n + 4*7. These maxima include warm retained
-        // scratch and the simultaneous replacement factor.
-        let vectors = 2 * (107*n + 4) * std::mem::size_of::<f64>()
-            + 2 * (12*n + 28 + 4) * std::mem::size_of::<usize>();
-        let owners = std::mem::size_of::<Self>()
-            + 2 * std::mem::size_of::<SparseFactors>()
-            + 2 * std::mem::size_of::<crate::numeric::factorize::NodeFactors>()
-            + 2 * std::mem::size_of::<Option<usize>>() + 512;
-        Some(matrices + vectors + owners)
-    }
-
-    fn factor_bounded_dense(&mut self, matrix: &CscMatrix, check_inertia: Option<Inertia>, maximum: usize) -> FactorStatus {
-        if Self::bounded_dense_storage_bytes(maximum).is_none()
-            || matrix.n == 0 || matrix.n > maximum || self.use_parallel
-            || !matches!(self.ordering, OrderingMethod::Amd)
-            || self.profiling_enabled || !self.race_arms.is_empty()
-            || !matches!(self.numeric_params.scaling, ScalingStrategy::Auto | ScalingStrategy::InfNorm | ScalingStrategy::Identity)
-        {
-            return FactorStatus::FatalError(FeralError::InvalidInput("unsupported bounded dense profile".into()));
-        }
-        // The generic driver would do symbolic work and then select this exact
-        // same numeric owner. Keep arithmetic and inertia classification there.
-        let result = crate::numeric::factorize::dense_fast_factor_with_workspace(matrix, &self.numeric_params, &mut self.workspace);
-        match result {
-            Ok((factors, inertia)) => {
-                self.last_factors = Some(factors);
-                self.last_inertia = Some(inertia.clone());
-                self.last_nnz_a = Some(matrix.nnz());
-                self.last_pattern_reused = Some(false);
-                if let Some(expected) = check_inertia {
-                    if inertia == expected { FactorStatus::Success }
-                    else { FactorStatus::WrongInertia {actual: inertia, expected} }
-                } else { FactorStatus::Success }
-            }
-            Err(error) => {
-                self.last_factors = None;
-                self.last_inertia = None;
-                self.last_nnz_a = None;
-                self.last_pattern_reused = None;
-                match error { FeralError::NumericallyRankDeficient => FactorStatus::Singular, error => FactorStatus::FatalError(error) }
-            }
-        }
+        let square = n.checked_mul(n)?;
+        let cube = square.checked_mul(n)?;
+        // <=n fronts, each <=n*n; old/new factors, contribution blocks, blocked
+        // scalar work, dense/kernel buffers and simultaneous symbolic retry owners.
+        let reals = cube.checked_mul(48)?.checked_add(square.checked_mul(96)?)?
+            .checked_add(n.checked_mul(nrhs.max(1))?.checked_mul(64)?)?;
+        // AMD full adjacency, symbolic candidates, MC64 full cost graph/heap,
+        // permutations, delayed maps, node layouts and sparse CSC/value maps.
+        let indices = cube.checked_mul(16)?.checked_add(square.checked_mul(192)?)?
+            .checked_add(n.checked_mul(256)?)?;
+        // The bound counts headers at each original column even when node merging
+        // decreases the actual number. It also covers nested Vec minima/growth.
+        let headers = n.checked_mul(16)?.checked_mul(
+            std::mem::size_of::<SymbolicFactorization>()
+                + std::mem::size_of::<SparseFactors>()
+                + std::mem::size_of::<crate::numeric::factorize::NodeFactors>()
+                + std::mem::size_of::<FactorWorkspace>() + 1024)?;
+        reals.checked_mul(2*std::mem::size_of::<f64>())?
+            .checked_add(indices.checked_mul(2*std::mem::size_of::<usize>())?)?
+            .checked_add(headers)?.checked_add(std::mem::size_of::<Self>())
     }
 
     pub fn factor(&mut self, matrix: &CscMatrix, check_inertia: Option<Inertia>) -> FactorStatus {
@@ -1391,8 +1362,13 @@ impl Solver {
                 )));
             }
         }
-        if let Some(maximum) = self.bounded_dense_max_dimension {
-            return self.factor_bounded_dense(matrix, check_inertia, maximum);
+        if let Some(maximum) = self.bounded_storage_max_dimension {
+            if Self::conservative_storage_bytes(maximum,maximum).is_none()
+                || matrix.n == 0 || matrix.n > maximum || matrix.nnz()>maximum.saturating_mul(maximum) || self.use_parallel
+                || !matches!(self.ordering,OrderingMethod::Amd)
+                || self.profiling_enabled || !self.race_arms.is_empty()
+                || !matches!(self.numeric_params.scaling,ScalingStrategy::Auto|ScalingStrategy::InfNorm|ScalingStrategy::Identity|ScalingStrategy::Mc64Symmetric)
+            { return FactorStatus::FatalError(FeralError::InvalidInput("unsupported admitted serial storage profile".into())); }
         }
         // Step 1: pattern fingerprint.
         let fp = PatternFingerprint::of(matrix);
@@ -5201,29 +5177,21 @@ mod tests {
         assert!(!p.profiling_enabled, "a probe must not collect profiles");
     }
     #[test]
-    fn bounded_dense_profile_calls_existing_numeric_kernel_and_refuses_larger_geometry() {
-        for n in 1..=7 {
-            let mut matrix=CscMatrix::from_triplets(n,&(0..n).collect::<Vec<_>>(),&(0..n).collect::<Vec<_>>(),&vec![2.0;n]).unwrap();
-            let mut normal=Solver::new().with_parallel(false).with_ordering(OrderingMethod::Amd).with_scaling(ScalingStrategy::InfNorm);
-            let mut bounded=Solver::new().with_parallel(false).with_ordering(OrderingMethod::Amd).with_scaling(ScalingStrategy::InfNorm).with_bounded_dense_max_dimension(7);
+    fn admitted_storage_profile_preserves_real_sparse_mc64_arithmetic() {
+        for n in [4,16,128] {
+            let rows:Vec<_>=(0..n).collect();
+            let matrix=CscMatrix::from_triplets(n,&rows,&rows,&vec![2.;n]).unwrap();
+            let mut normal=Solver::new().with_parallel(false).with_ordering(OrderingMethod::Amd).with_scaling(ScalingStrategy::Mc64Symmetric);
+            let mut admitted=Solver::new().with_parallel(false).with_ordering(OrderingMethod::Amd).with_scaling(ScalingStrategy::Mc64Symmetric).with_bounded_storage_max_dimension(n);
             for _ in 0..2 {
                 assert!(matches!(normal.factor(&matrix,None),FactorStatus::Success));
-                assert!(matches!(bounded.factor(&matrix,None),FactorStatus::Success));
-                for nrhs in 1..=7 {
-                    let rhs=vec![1.25;n*nrhs];
-                    assert_eq!(normal.solve_many_refined(&matrix,&rhs,nrhs).unwrap(),bounded.solve_many_refined(&matrix,&rhs,nrhs).unwrap());
-                }
-                matrix.values.iter_mut().for_each(|value|*value*=1.125);
+                assert!(matches!(admitted.factor(&matrix,None),FactorStatus::Success));
+                assert_eq!(normal.solve_many_refined(&matrix,&vec![1.;n*2],2).unwrap(),admitted.solve_many_refined(&matrix,&vec![1.;n*2],2).unwrap());
             }
-            assert!(bounded.last_symbolic.is_none());
-            assert_eq!(bounded.symbolic_call_count(),0);
-            assert!(Solver::bounded_dense_storage_bytes(7).unwrap()>std::mem::size_of::<Solver>());
+            if n==128 {assert!(admitted.symbolic_call_count()>0);}
+            assert!(Solver::conservative_storage_bytes(n,n).unwrap()>std::mem::size_of::<Solver>());
         }
-        assert_eq!(Solver::bounded_dense_storage_bytes(8),None);
-        let matrix=CscMatrix::from_triplets(8,&(0..8).collect::<Vec<_>>(),&(0..8).collect::<Vec<_>>(),&vec![2.0;8]).unwrap();
-        let mut solver=Solver::new().with_parallel(false).with_ordering(OrderingMethod::Amd).with_bounded_dense_max_dimension(7);
-        assert!(matches!(solver.factor(&matrix,None),FactorStatus::FatalError(_)));
-        assert!(solver.last_factors.is_none());
+        assert!(Solver::conservative_storage_bytes(usize::MAX,1).is_none());
     }
 
 }

@@ -29,7 +29,7 @@ pub enum StorageScope { Application, Linear }
 pub enum Event {
     /// Before allocation. Extent describes known owner buffers; opaque=true is an
     /// explicit request for a complete foreign reservation, never a complete estimate.
-    Storage { scope: StorageScope, owner: &'static str, known_bytes: usize, opaque: bool },
+    Storage { scope: StorageScope, owner: &'static str, instance: usize, known_bytes: usize, opaque: bool },
     Begin { path: Path, primitive: Primitive, rhs: usize, refinement_bound: usize },
     End { path: Path, primitive: Primitive, succeeded: bool },
     Selected { schur: bool, reason: &'static str },
@@ -39,17 +39,19 @@ pub trait Observer {
     fn event(&self, event: &Event) -> Result<(), Abort>;
 }
 #[derive(Default)]
-struct State { observer: Option<Rc<dyn Observer>>, abort: Option<Abort>, linear_maximum: Option<usize> }
+struct State { observer: Option<Rc<dyn Observer>>, abort: Option<Abort>, linear_maximum: Option<usize>, linear_bounded: bool }
 thread_local! { static ACTIVE: RefCell<State> = RefCell::new(State::default()); }
 pub struct Scope { previous: Option<State> }
 impl Scope {
     pub fn enter(observer: Rc<dyn Observer>) -> Self {
-        let previous = ACTIVE.with(|state| state.replace(State { observer: Some(observer), abort: None, linear_maximum: None }));
+        let previous = ACTIVE.with(|state| state.replace(State { observer: Some(observer), abort: None, linear_maximum: None, linear_bounded: false }));
         Self { previous: Some(previous) }
     }
     pub fn abort(&self) -> Option<Abort> { abort() }
 }
 impl Drop for Scope { fn drop(&mut self) { if let Some(previous) = self.previous.take() { ACTIVE.with(|state| {state.replace(previous);}); } } }
+pub fn set_linear_bounded(bounded:bool) { ACTIVE.with(|state|state.borrow_mut().linear_bounded=bounded); }
+pub fn linear_bounded()->bool {ACTIVE.with(|state|state.borrow().linear_bounded)}
 pub fn set_linear_maximum(maximum:Option<usize>) { ACTIVE.with(|state|state.borrow_mut().linear_maximum=maximum); }
 pub fn linear_maximum()->Option<usize> {ACTIVE.with(|state|state.borrow().linear_maximum)}
 pub fn reject(error:Abort) { ACTIVE.with(|state| {let mut state=state.borrow_mut();if state.abort.is_none(){state.abort=Some(error);}}); }
@@ -87,6 +89,19 @@ mod tests {
         fn event(&self, _: &Event) -> Result<(), Abort> { Err(Abort::Resource("pool".into())) }
     }
     #[test]
+    fn wrapper_storage_overflow_and_refusal_are_terminal_before_work() {
+        let scope=Scope::enter(Rc::new(Deny));
+        set_linear_bounded(true);
+        assert!(!reserve_wrapper("woodbury",1,usize::MAX,1,0));
+        assert!(matches!(scope.abort(),Some(Abort::Resource(_))));
+        assert!(Operation::begin(Path::Monolithic,Primitive::Factor,0,0).is_err());
+        drop(scope);
+        let scope=Scope::enter(Rc::new(Deny));
+        set_linear_bounded(true);
+        assert!(!reserve_wrapper("restoration",2,12,4,24));
+        assert!(scope.abort().is_some());
+    }
+    #[test]
     fn admission_abort_is_sticky_and_next_attempt_resets_it() {
         let scope=Scope::enter(Rc::new(Deny));
         assert!(Operation::begin(Path::SchurF,Primitive::Factor,0,0).is_err());
@@ -95,4 +110,17 @@ mod tests {
         drop(scope);
         assert!(abort().is_none());
     }
+}
+
+/// Reserve simultaneously live dense/multivector wrapper owners before construction.
+/// Includes old/new copies, rank products, projected triplets, action scratch and headers.
+pub fn reserve_wrapper(owner:&'static str,instance:usize,n:usize,rank:usize,triplets:usize)->bool {
+    let extent=(|| {let scalars=n.checked_mul(n)?.checked_mul(128)?
+        .checked_add(n.checked_mul(rank)?.checked_mul(128)?)?
+        .checked_add(rank.checked_mul(rank)?.checked_mul(64)?)?
+        .checked_add(triplets.checked_mul(128)?)?.checked_add(n.checked_mul(256)?)?.checked_add(1024)?;
+        scalars.checked_mul(2*std::mem::size_of::<usize>())}) ();
+    let bounded=linear_bounded();
+    if bounded && extent.is_none(){reject(Abort::Resource("linear wrapper storage extent overflow".into()));return false;}
+    event(Event::Storage {scope:StorageScope::Linear,owner,instance,known_bytes:extent.unwrap_or(0),opaque:!bounded}).is_ok()
 }

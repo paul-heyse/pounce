@@ -64,7 +64,10 @@ const FERAL_BITWISE_MULTI_SOLVE_MAX_NRHS: usize = 16;
 /// contract.
 pub struct FeralSolverInterface {
     solver: Solver,
-    bounded_dense_max_dimension: Option<usize>,
+    bounded_storage_max_dimension: Option<usize>,
+    storage_complete: bool,
+    storage_dimension: usize,
+    storage_nonzeros: usize,
 
     initialized: bool,
     pivtol_changed: bool,
@@ -196,9 +199,10 @@ pub fn inertia_trust_floor(configured: Option<f64>, dim: usize) -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct FeralConfig {
-    /// Optional complete-storage serial dense profile, currently dimensions 1..=7.
-    /// Requires AMD, serial execution and Auto/InfNorm/Identity scaling.
-    pub bounded_dense_max_dimension: Option<usize>,
+    /// Optional hard geometry constraint on complete serial AMD storage.
+    /// No dimension is supplied by default: admission derives the actual layout.
+    /// Includes the regular sparse route and Auto/InfNorm/Identity/MC64 scaling.
+    pub bounded_storage_max_dimension: Option<usize>,
     /// Tri-state. `None` (the pounce default) inherits whatever FERAL's
     /// `NumericParams::default()` ships with — as of FERAL Phase B
     /// (issue #55, commit 7554a78) that is CB armed with
@@ -584,7 +588,7 @@ pub struct FeralConfig {
 impl Default for FeralConfig {
     fn default() -> Self {
         Self {
-            bounded_dense_max_dimension: None,
+            bounded_storage_max_dimension: None,
             cascade_break: None,
             fma: false,
             // On -- see the field doc. The NLP solver turns it off in
@@ -659,7 +663,7 @@ impl FeralConfig {
     /// [`resolve_pivtol_env`]).
     pub fn from_env() -> Self {
         Self {
-            bounded_dense_max_dimension: None,
+            bounded_storage_max_dimension: None,
             cascade_break: parse_bool_env(
                 std::env::var("POUNCE_FERAL_CASCADE_BREAK").ok().as_deref(),
             ),
@@ -764,14 +768,23 @@ pub fn parse_ordering_method(s: &str) -> Option<OrderingMethod> {
     }
 }
 
+/// Source-owned complete storage profile. External ordering/native workers remain opaque.
+pub fn complete_storage_profile(cfg:&FeralConfig)->bool {
+    cfg.parallel == Some(false) && matches!(cfg.ordering,OrderingMethod::Amd)
+        && matches!(cfg.scaling,ScalingStrategy::Auto|ScalingStrategy::InfNorm|ScalingStrategy::Identity|ScalingStrategy::Mc64Symmetric)
+}
+
 /// Complete reservation for monolithic owner buffers and FERAL's supported
 /// bounded profile. CSC build owns at most old+new arrays, pairs and offsets;
 /// wrapper owns rows/cols/values/slot, optional factor-pattern copy and residual.
 /// All Vec growth is covered by 2x capacity plus four-element minima.
 pub fn bounded_factor_storage(maximum: usize, nonzeros: usize) -> Option<usize> {
-    let native = Solver::bounded_dense_storage_bytes(maximum)?;
-    let indices = nonzeros.checked_mul(16)?.checked_add((maximum+1)*16+64)?;
-    let reals = nonzeros.checked_mul(12)?.checked_add(maximum*7*4+32)?;
+    bounded_factor_storage_for_rhs(maximum,nonzeros,maximum)
+}
+fn bounded_factor_storage_for_rhs(maximum:usize,nonzeros:usize,nrhs:usize)->Option<usize> {
+    let native = Solver::conservative_storage_bytes(maximum,nrhs)?;
+    let indices = nonzeros.checked_mul(16)?.checked_add(maximum.checked_add(1)?.checked_mul(16)?.checked_add(64)?)?;
+    let reals = nonzeros.checked_mul(12)?.checked_add(maximum.checked_mul(28)?.checked_add(32)?)?;
     native.checked_add(indices.checked_mul(std::mem::size_of::<usize>())?)?
         .checked_add(reals.checked_mul(std::mem::size_of::<Number>())?)?
         .checked_add(std::mem::size_of::<FeralSolverInterface>()+512)
@@ -812,7 +825,7 @@ pub(crate) fn configure_solver(cfg: &FeralConfig) -> Solver {
         }
     }
     let mut solver = Solver::with_params(np, SupernodeParams::default());
-    if let Some(maximum) = cfg.bounded_dense_max_dimension { solver = solver.with_bounded_dense_max_dimension(maximum); }
+    if let Some(maximum) = cfg.bounded_storage_max_dimension { solver = solver.with_bounded_storage_max_dimension(maximum); }
     // Internal-parallelism toggle. Explicit `cfg.parallel` is the primary
     // per-backend lever; when unset, fall back to the legacy process-wide
     // `FERAL_PARALLEL` env var. The env var is bidirectional and uses the
@@ -930,7 +943,10 @@ impl FeralSolverInterface {
         let solver = configure_solver(&cfg);
         Self {
             solver,
-            bounded_dense_max_dimension: cfg.bounded_dense_max_dimension,
+            bounded_storage_max_dimension: cfg.bounded_storage_max_dimension,
+            storage_complete: complete_storage_profile(&cfg),
+            storage_dimension: 0,
+            storage_nonzeros: 0,
             initialized: false,
             pivtol_changed: false,
             refactorize: false,
@@ -1243,7 +1259,14 @@ impl FeralSolverInterface {
         if operation.finish(status == ESymSolverStatus::Success) { status } else { ESymSolverStatus::FatalError }
     }
     fn backsolve_unobserved(&mut self, nrhs: Index, rhs_vals: &mut [Number]) -> ESymSolverStatus {
-        if self.bounded_dense_max_dimension.is_some() && !(0..=7).contains(&nrhs) { return ESymSolverStatus::FatalError; }
+        if nrhs < 0 { return ESymSolverStatus::FatalError; }
+        if self.storage_complete {
+            let n=self.storage_dimension;
+            let retained_rhs=if n>0 {self.x_scratch.capacity().div_ceil(n)} else {0};
+            let extent=bounded_factor_storage_for_rhs(n,self.storage_nonzeros,(nrhs as usize).max(n).max(retained_rhs));
+            let Some(known_bytes)=extent else {pounce_common::observed::reject(pounce_common::observed::Abort::Resource("monolithic action storage overflow".into()));return ESymSolverStatus::FatalError;};
+            if pounce_common::observed::event(pounce_common::observed::Event::Storage {scope:pounce_common::observed::StorageScope::Linear,owner:"monolithic-factor", instance:self as *const Self as usize, known_bytes,opaque:false}).is_err() {return ESymSolverStatus::FatalError;}
+        }
         let n = self.dim as usize;
         let nrhs = nrhs as usize;
         debug_assert_eq!(rhs_vals.len(), n * nrhs);
@@ -1394,24 +1417,31 @@ impl SparseSymLinearSolverInterface for FeralSolverInterface {
         ia: &[Index],
         ja: &[Index],
     ) -> ESymSolverStatus {
-        let extent = self.bounded_dense_max_dimension.and_then(|maximum| {
-            if dim <= 0 || dim as usize > maximum || nonzeros < 0 {return None;}
-            bounded_factor_storage(maximum, nonzeros as usize)
-        });
-        if self.bounded_dense_max_dimension.is_some() && extent.is_none() {
-            pounce_common::observed::reject(pounce_common::observed::Abort::Contract("monolithic geometry exceeds bounded profile".into()));
-            let _ = pounce_common::observed::event(pounce_common::observed::Event::Storage {scope: pounce_common::observed::StorageScope::Linear, owner:"unsupported-monolithic-profile",known_bytes:0,opaque:true});
+        if dim <= 0 || nonzeros < 0 || self.bounded_storage_max_dimension.is_some_and(|maximum|dim as usize>maximum) {
+            pounce_common::observed::reject(pounce_common::observed::Abort::Contract("monolithic geometry exceeds admitted profile".into()));
+            return ESymSolverStatus::FatalError;
+        }
+        let extent = if self.storage_complete {
+            {
+                let n=(dim as usize).max(self.storage_dimension);
+                bounded_factor_storage_for_rhs(n,(nonzeros as usize).max(self.storage_nonzeros),n.max(self.x_scratch.capacity().div_ceil(n)))
+            }
+        } else { None };
+        if self.storage_complete && extent.is_none() {
+            pounce_common::observed::reject(pounce_common::observed::Abort::Resource("monolithic storage extent overflow".into()));
             return ESymSolverStatus::FatalError;
         }
         if pounce_common::observed::event(pounce_common::observed::Event::Storage {
             scope: pounce_common::observed::StorageScope::Linear,
-            owner: "monolithic-factor", known_bytes: extent.unwrap_or(0), opaque: extent.is_none(),
+            owner: "monolithic-factor", instance:self as *const Self as usize, known_bytes: extent.unwrap_or(0), opaque: extent.is_none(),
         }).is_err() { return ESymSolverStatus::FatalError; }
 
 
         assert_eq!(ia.len(), nonzeros as usize);
         assert_eq!(ja.len(), nonzeros as usize);
 
+        self.storage_dimension=self.storage_dimension.max(dim as usize);
+        self.storage_nonzeros=self.storage_nonzeros.max(nonzeros as usize);
         self.dim = dim;
         self.nonzeros = nonzeros;
         self.values = vec![0.0; nonzeros as usize];

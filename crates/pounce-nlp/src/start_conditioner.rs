@@ -199,27 +199,13 @@ impl ConditionedStartTnlp {
     /// numerically but would still turn "free" into "bounded" if the sentinel
     /// were ever tightened.
     fn clip(&self, v: Number, lo: Number, hi: Number) -> Number {
-        let mut v = v;
-        if lo > self.lower_inf && v < lo {
-            v = lo;
-        }
-        if hi < self.upper_inf && v > hi {
-            v = hi;
-        }
-        v
+        clip(v,lo,hi,self.lower_inf,self.upper_inf)
     }
 
     /// A finite, in-bounds stand-in for a variable whose incoming value was
     /// `NaN` or infinite.
     fn sanitised_value(&self, lo: Number, hi: Number) -> Number {
-        let lo_present = lo > self.lower_inf;
-        let hi_present = hi < self.upper_inf;
-        match (lo_present, hi_present) {
-            (true, true) => 0.5 * (lo + hi),
-            (true, false) => lo + 1.0,
-            (false, true) => hi - 1.0,
-            (false, false) => 0.0,
-        }
+        sanitised_value(lo,hi,self.lower_inf,self.upper_inf)
     }
 }
 
@@ -256,15 +242,10 @@ pub fn violation(g: &[Number], g_l: &[Number], g_u: &[Number], out: &mut [Number
     }
 }
 
-impl ConditionedStartTnlp {
-    fn apply_jitter(
-        &self,
-        x: &mut [Number],
-        x_l: &[Number],
-        x_u: &[Number],
-        seed: u64,
-        scale: Number,
-    ) -> ConditionerReport {
+/// Apply the same deterministic displacement as the TNLP conditioner, without
+/// starting a solve. Consumers can screen and identify this actual proposal first.
+/// Bounds use the supplied native infinity sentinels.
+pub fn jitter_start(x: &mut [Number], x_l: &[Number], x_u: &[Number], seed: u64, scale: Number, lower_inf: Number, upper_inf: Number) -> ConditionerReport {
         let mut report = ConditionerReport::default();
         let mut state = seed;
         for i in 0..x.len() {
@@ -277,14 +258,34 @@ impl ConditionedStartTnlp {
                 x[i]
             } else {
                 report.sanitised.push(i);
-                self.sanitised_value(lo, hi)
+                sanitised_value(lo, hi, lower_inf, upper_inf)
             };
             let step = scale * (1.0 + base.abs()) * unit_symmetric(&mut state);
-            let moved = self.clip(base + step, lo, hi);
+            let moved = clip(base + step, lo, hi, lower_inf, upper_inf);
             report.max_shift = report.max_shift.max((moved - base).abs());
             x[i] = moved;
         }
         report
+}
+
+fn clip(v:Number,lo:Number,hi:Number,lower_inf:Number,upper_inf:Number)->Number {
+    let v=if lo>lower_inf && v<lo {lo} else {v};
+    if hi<upper_inf && v>hi {hi} else {v}
+}
+fn sanitised_value(lo:Number,hi:Number,lower_inf:Number,upper_inf:Number)->Number {
+    match (lo>lower_inf,hi<upper_inf) {(true,true)=>0.5*(lo+hi),(true,false)=>lo+1.,(false,true)=>hi-1.,(false,false)=>0.}
+}
+
+impl ConditionedStartTnlp {
+    fn apply_jitter(
+        &self,
+        x: &mut [Number],
+        x_l: &[Number],
+        x_u: &[Number],
+        seed: u64,
+        scale: Number,
+    ) -> ConditionerReport {
+        jitter_start(x,x_l,x_u,seed,scale,self.lower_inf,self.upper_inf)
     }
 
     fn apply_adam(
@@ -788,6 +789,15 @@ mod tests {
     // ---- jitter -----------------------------------------------------------
 
     #[test]
+    fn public_jitter_producer_matches_the_native_conditioner() {
+        let toy=Toy::new(5);
+        let mut point=toy.start.clone();
+        let report=jitter_start(&mut point,&toy.x_l,&toy.x_u,7,1e-2,-DEFAULT_BOUND_INF,DEFAULT_BOUND_INF);
+        let (native,native_report)=conditioned(toy,jitter(7));
+        assert_eq!(point,native);
+        assert_eq!(report,native_report);
+    }
+    #[test]
     fn the_same_seed_produces_the_same_point() {
         let (a, _) = conditioned(Toy::new(5), jitter(7));
         let (b, _) = conditioned(Toy::new(5), jitter(7));
@@ -937,7 +947,7 @@ mod tests {
         let inner: Rc<RefCell<dyn TNLP>> = toy.clone();
         let mut wrapped = ConditionedStartTnlp::new(inner, adam(200));
 
-        let mut ask = |w: &mut ConditionedStartTnlp| {
+        let ask = |w: &mut ConditionedStartTnlp| {
             let (mut x, mut z_l, mut z_u, mut lam) =
                 (vec![0.0; 3], vec![0.0; 3], vec![0.0; 3], vec![0.0; 1]);
             assert!(w.get_starting_point(StartingPoint {
